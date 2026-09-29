@@ -1,0 +1,1186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Wed, 30 Sep 2026 01:01:04 +0800
+Subject: [PATCH 2/2] client: expose ordered observations and joined shutdown
+
+Install a synchronous observer before workers start, report each received query-set transition and connection state, and report terminal closure without turning snapshots into a database change log. Keep the existing bounded state channel best effort so a full receiver cannot block reconnects or shutdown.
+
+Give cloned clients one cancellation-safe joined close operation covering both background tasks, retain final-drop cancellation, and preserve buffered stream and submitted-mutation semantics. Add local WebSocket lifecycle fixtures and document the replay, observation and distribution boundaries.
+---
+ patches/README.md              |  43 +++++
+ src/client/mod.rs              | 149 +++++++++++---
+ src/client/subscription.rs     |   3 +
+ src/client/worker.rs           | 104 +++++++++-
+ src/lib.rs                     |   1 +
+ src/sync/mod.rs                |  13 +-
+ src/sync/web_socket_manager.rs |  62 ++++--
+ tests/observation.rs           | 344 +++++++++++++++++++++++++++++++++
+ 8 files changed, 663 insertions(+), 56 deletions(-)
+ create mode 100644 patches/README.md
+ create mode 100644 tests/observation.rs
+
+diff --git a/patches/README.md b/patches/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..6ef2e0e6d9efe174fb5902a1c8162baf30717f28
+--- /dev/null
++++ b/patches/README.md
+@@ -0,0 +1,43 @@
++# Maintained Rust client patches
++
++The source branch carries two patches over the reviewed upstream base. The orphan
++`patch-history` branch records their exact upstream commit, ordered mail patches,
++source IDs and reconstructed result tree.
++
++## Stable reconnect identity
++
++One client worker retains its session ID across reconnects and resends outstanding
++mutations with their original request IDs. Separate clients retain independent
++sessions. The server's successful-result lookup determines replay behavior; a stable
++identity does not add a new client retry policy or extend server retention.
++
++## Ordered observation and joined shutdown
++
++`ConvexClientBuilder::with_observer` installs a callback before background tasks
++start. It exposes received query-set transitions, connection states and terminal
++closure. Query callbacks are ordered; connection callbacks can run concurrently.
++The callback must not block or panic. Query snapshots remain consistent views and
++can already have skipped database transactions on the server.
++
++`ConvexClient::close` closes all clones and joins the worker and transport. Canceling
++one caller does not cancel shared shutdown. Dropping the last client requests
++cancellation without waiting. Already buffered subscription results may still be
++read, and closing cannot undo a mutation submitted to the server.
++
++The existing connection-state channel is best effort and cannot block reconnect or
++shutdown when full. Applications that need every received transition can use the
++observer and explicitly handle their own bounded queues and lifetime fencing.
++
++## Verification and distribution
++
++Local WebSocket fixtures cover ordered observation, slow/full notification consumers,
++shutdown ownership and reconnect replay identity. They do not run a real backend or
++prove transaction retention. The upstream package's testing feature references
++omitted generated testing modules; the focused fixtures were also exercised through
++a downstream harness importing the actual SDK sources.
++
++Consumers may pin the reviewed source revision or retain an immutable source
++snapshot. These patches need no crates.io version change, registry publication or
++binary release. Preserve existing PR branches and published source references when
++updating the maintained source train. Regenerate patch-history with the canonical
++updater and verify it using that branch's `scripts/apply.sh`.
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index 063cd4487ef0e1ade474ba8dcc706b7cb5b1d13f..b2a122827762392ce9ad2630c229ed0d74c1936d 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -1,6 +1,5 @@
+ use std::{
+     collections::BTreeMap,
+-    convert::Infallible,
+     future::Future,
+     pin::Pin,
+     sync::Arc,
+@@ -13,14 +12,26 @@ use convex_sync_types::{
+ };
+ #[cfg(doc)]
+ use futures::Stream;
+-use futures::StreamExt;
++use futures::{
++    future::{
++        BoxFuture,
++        Shared,
++    },
++    FutureExt,
++    StreamExt,
++};
+ use tokio::{
+     sync::{
+         broadcast,
+         mpsc,
+         oneshot,
++        watch,
++    },
++    task::{
++        AbortHandle,
++        JoinError,
++        JoinHandle,
+     },
+-    task::JoinHandle,
+ };
+ use tokio_stream::wrappers::BroadcastStream;
+ use url::Url;
+@@ -60,6 +71,50 @@ mod worker;
+ 
+ const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
+ 
++/// An observation from the client's background tasks.
++///
++/// Query results are delivered in protocol order without local coalescing. They
++/// are consistent snapshots, not a record of every database transaction.
++pub enum ClientEvent {
++    /// A completed query-set transition received from the server.
++    /// Pending subscriptions can have no result yet. Adding a subscriber to a
++    /// cached query does not itself emit a transition.
++    QueryResults(QueryResults),
++    /// The transport connected or began connecting again. A connection alone
++    /// does not mean that the query set has caught up.
++    ConnectionState(WebSocketState),
++    /// The client worker stopped, including cancellation or failure.
++    Closed,
++}
++
++pub(crate) type ClientObserver = Arc<dyn Fn(ClientEvent) + Send + Sync>;
++
++struct ClientWorker {
++    shutdown: watch::Sender<bool>,
++    abort: AbortHandle,
++    closed: Shared<BoxFuture<'static, Result<(), Arc<JoinError>>>>,
++}
++
++impl ClientWorker {
++    fn new(handle: JoinHandle<Result<(), JoinError>>, shutdown: watch::Sender<bool>) -> Self {
++        let abort = handle.abort_handle();
++        let closed = async move { handle.await.unwrap_or_else(Err).map_err(Arc::new) }
++            .boxed()
++            .shared();
++        Self {
++            shutdown,
++            abort,
++            closed,
++        }
++    }
++}
++
++impl Drop for ClientWorker {
++    fn drop(&mut self) {
++        self.abort.abort();
++    }
++}
++
+ /// An asynchronous client to interact with a specific project to perform
+ /// mutations and manage query subscriptions using [`tokio`].
+ ///
+@@ -89,7 +144,7 @@ const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
+ /// ## Examples
+ /// For example code, please refer to the examples directory.
+ pub struct ConvexClient {
+-    listen_handle: Option<Arc<JoinHandle<Infallible>>>,
++    worker: Arc<ClientWorker>,
+     request_sender: mpsc::UnboundedSender<ClientRequest>,
+     watch_receiver: broadcast::Receiver<QueryResults>,
+ }
+@@ -99,27 +154,13 @@ pub struct ConvexClient {
+ impl Clone for ConvexClient {
+     fn clone(&self) -> Self {
+         Self {
+-            listen_handle: self.listen_handle.clone(),
++            worker: self.worker.clone(),
+             request_sender: self.request_sender.clone(),
+             watch_receiver: self.watch_receiver.resubscribe(),
+         }
+     }
+ }
+ 
+-/// Drop the [`ConvexClient`]. When the final reference to the [`ConvexClient`]
+-/// is dropped, the connection is cleaned up.
+-impl Drop for ConvexClient {
+-    fn drop(&mut self) {
+-        if let Ok(j_handle) = Arc::try_unwrap(
+-            self.listen_handle
+-                .take()
+-                .expect("INTERNAL BUG: listen handle should never be none"),
+-        ) {
+-            j_handle.abort()
+-        }
+-    }
+-}
+-
+ impl ConvexClient {
+     /// Constructs a new client for communicating with `deployment_url`.
+     ///
+@@ -156,24 +197,43 @@ impl ConvexClient {
+             response_sender,
+             builder.on_state_change,
+             client_id.as_str(),
++            builder.observer.clone(),
+         )
+         .await?;
+ 
++        let (shutdown, shutdown_receiver) = watch::channel(false);
+         let listen_handle = tokio::spawn(worker(
+             response_receiver,
+             request_receiver,
+             watch_sender,
+             base_client,
+             protocol,
++            builder.observer,
++            shutdown_receiver,
+         ));
+         let client = ConvexClient {
+-            listen_handle: Some(Arc::new(listen_handle)),
++            worker: Arc::new(ClientWorker::new(listen_handle, shutdown)),
+             request_sender,
+             watch_receiver,
+         };
+         Ok(client)
+     }
+ 
++    /// Stop this shared client and wait for both background tasks to finish.
++    ///
++    /// This closes all clones and their subscriptions. Concurrent calls are
++    /// allowed, and canceling a caller does not cancel shared shutdown. Streams
++    /// can still yield already buffered results before ending. Dropping the
++    /// last client requests cancellation without waiting. Closing cannot
++    /// undo a mutation already submitted.
++    ///
++    /// Subsequent requests return errors. Auth setters retain their infallible
++    /// signatures and panic when called after shutdown.
++    pub async fn close(&self) -> anyhow::Result<()> {
++        self.worker.shutdown.send_replace(true);
++        self.worker.closed.clone().await.map_err(anyhow::Error::new)
++    }
++
+     /// Subscribe to the results of query `name` called with `args`.
+     ///
+     /// Returns a [`QuerySubscription`] which implements [`Stream`]<
+@@ -238,12 +298,11 @@ impl ConvexClient {
+         name: &str,
+         args: BTreeMap<String, Value>,
+     ) -> anyhow::Result<FunctionResult> {
+-        Ok(self
+-            .subscribe(name, args)
++        self.subscribe(name, args)
+             .await?
+             .next()
+             .await
+-            .expect("INTERNAL BUG: Convex Client dropped prematurely."))
++            .ok_or_else(|| anyhow::anyhow!("Client closed before query completed"))
+     }
+ 
+     /// Perform a mutation `name` with `args` and return a future
+@@ -318,6 +377,9 @@ impl ConvexClient {
+     /// implements [`Stream`]<[`QueryResults`]>.
+     /// Each item in the stream contains a consistent view
+     /// of the results of all the queries in the query set.
++    /// Slow consumers can skip intermediate snapshots. Use
++    /// [`ConvexClientBuilder::with_observer`] to observe each received
++    /// transition.
+     ///
+     /// Queries can be added to the query set via [`ConvexClient::subscribe`].
+     /// Queries can be removed from the query set via dropping the
+@@ -373,7 +435,7 @@ impl ConvexClient {
+         });
+         self.request_sender
+             .send(ClientRequest::Authenticate(fetcher))
+-            .expect("INTERNAL BUG: Worker has gone away");
++            .expect("Client is closed");
+     }
+ 
+     /// Set an auth token fetcher callback for use when calling Convex
+@@ -387,7 +449,7 @@ impl ConvexClient {
+     pub async fn set_auth_callback(&mut self, fetcher: Option<AuthTokenFetcher>) {
+         self.request_sender
+             .send(ClientRequest::Authenticate(fetcher))
+-            .expect("INTERNAL BUG: Worker has gone away");
++            .expect("Client is closed");
+     }
+ 
+     /// Set admin auth for use when calling Convex functions as a deployment
+@@ -409,7 +471,7 @@ impl ConvexClient {
+         });
+         self.request_sender
+             .send(ClientRequest::Authenticate(Some(fetcher)))
+-            .expect("INTERNAL BUG: Worker has gone away");
++            .expect("Client is closed");
+     }
+ }
+ 
+@@ -431,6 +493,7 @@ pub struct ConvexClientBuilder {
+     deployment_url: String,
+     client_id: Option<String>,
+     on_state_change: Option<mpsc::Sender<WebSocketState>>,
++    observer: Option<ClientObserver>,
+ }
+ 
+ impl ConvexClientBuilder {
+@@ -440,6 +503,7 @@ impl ConvexClientBuilder {
+             deployment_url: deployment_url.to_string(),
+             client_id: None,
+             on_state_change: None,
++            observer: None,
+         }
+     }
+ 
+@@ -450,12 +514,32 @@ impl ConvexClientBuilder {
+     }
+ 
+     /// Set a channel to be notified of changes to the WebSocket connection
+-    /// state.
++    /// state. Notifications are best effort and are dropped when the channel is
++    /// full. Use [`Self::with_observer`] when every connection change matters.
+     pub fn with_on_state_change(mut self, on_state_change: mpsc::Sender<WebSocketState>) -> Self {
+         self.on_state_change = Some(on_state_change);
+         self
+     }
+ 
++    /// Observe each query-set transition and connection change without an
++    /// intermediate SDK queue. The observer is installed before tasks start.
++    ///
++    /// The callback must not block or panic. It may run concurrently on the
++    /// connection and query workers; query-result callbacks remain ordered.
++    /// A bounded application queue must detect overflow itself. For example,
++    /// revoke a consumer's lifetime synchronously if enqueueing fails or a
++    /// connection becomes unavailable, and never restore it on reconnect.
++    ///
++    /// Initial connection state is `Connecting`; repeated state notifications
++    /// are possible. Results received before disconnect can still be in flight
++    /// when the connection notification arrives. Fence those results in the
++    /// application. Shutdown can discard unapplied messages before `Closed`.
++    /// This API does not make query subscriptions a change log.
++    pub fn with_observer(mut self, observer: impl Fn(ClientEvent) + Send + Sync + 'static) -> Self {
++        self.observer = Some(Arc::new(observer));
++        self
++    }
++
+     /// Build the [`ConvexClient`] with the configured options.
+     ///
+     /// ```no_run
+@@ -502,7 +586,10 @@ pub mod tests {
+         mpsc,
+     };
+ 
+-    use super::ConvexClient;
++    use super::{
++        ClientWorker,
++        ConvexClient,
++    };
+     use crate::{
+         base_client::FunctionResult,
+         client::{
+@@ -537,20 +624,24 @@ pub mod tests {
+                 response_sender,
+                 None,
+                 "rust-0.0.1",
++                None,
+             )
+             .await?;
+             let base_client = BaseConvexClient::new();
+ 
++            let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
+             let listen_handle = tokio::spawn(worker(
+                 response_receiver,
+                 request_receiver,
+                 watch_sender,
+                 base_client,
+                 test_protocol.clone(),
++                None,
++                shutdown_receiver,
+             ));
+ 
+             let client = ConvexClient {
+-                listen_handle: Some(Arc::new(listen_handle)),
++                worker: Arc::new(ClientWorker::new(listen_handle, shutdown)),
+                 request_sender,
+                 watch_receiver,
+             };
+diff --git a/src/client/subscription.rs b/src/client/subscription.rs
+index 0f3b47868435a26f11e1ce6c22c199880aa699fa..a125ae641ae3b4a6be288883702b43d8fc226fb7 100644
+--- a/src/client/subscription.rs
++++ b/src/client/subscription.rs
+@@ -112,6 +112,9 @@ impl Stream for QuerySubscription {
+ /// implements [`Stream`]<[`QueryResults`]>.
+ /// Each item in the stream contains a consistent view
+ /// of the results of all the queries in the query set.
++/// Intermediate snapshots can be skipped when the consumer lags. Use
++/// [`crate::ConvexClientBuilder::with_observer`] to observe every received
++/// query-set transition without local coalescing.
+ ///
+ /// Queries can be added to the query set via [`ConvexClient::subscribe`].
+ /// Queries can be removed from the query set via dropping the
+diff --git a/src/client/worker.rs b/src/client/worker.rs
+index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790f6507888 100644
+--- a/src/client/worker.rs
++++ b/src/client/worker.rs
+@@ -1,6 +1,11 @@
+ use std::{
+     collections::BTreeMap,
+     convert::Infallible,
++    future::Future,
++    panic::{
++        resume_unwind,
++        AssertUnwindSafe,
++    },
+     time::Duration,
+ };
+ 
+@@ -8,10 +13,15 @@ use convex_sync_types::{
+     backoff::Backoff,
+     UdfPath,
+ };
+-use tokio::sync::{
+-    broadcast,
+-    mpsc,
+-    oneshot,
++use futures::FutureExt;
++use tokio::{
++    sync::{
++        broadcast,
++        mpsc,
++        oneshot,
++        watch,
++    },
++    task::JoinError,
+ };
+ use tokio_stream::wrappers::BroadcastStream;
+ 
+@@ -22,6 +32,8 @@ use crate::{
+         SubscriberId,
+     },
+     client::{
++        ClientEvent,
++        ClientObserver,
+         QueryResults,
+         QuerySubscription,
+     },
+@@ -30,6 +42,7 @@ use crate::{
+         ReconnectProtocolReason,
+         ReconnectRequest,
+         SyncProtocol,
++        WebSocketState,
+     },
+     value::Value,
+     FunctionResult,
+@@ -76,12 +89,62 @@ pub struct UnsubscribeRequest {
+     pub subscriber_id: SubscriberId,
+ }
+ 
+-pub async fn worker<T: SyncProtocol>(
++pub fn worker<T: SyncProtocol>(
++    protocol_response_receiver: mpsc::Receiver<ProtocolResponse>,
++    client_request_receiver: mpsc::UnboundedReceiver<ClientRequest>,
++    watch_sender: broadcast::Sender<QueryResults>,
++    base_client: BaseConvexClient,
++    mut protocol_manager: T,
++    observer: Option<ClientObserver>,
++    mut shutdown: watch::Receiver<bool>,
++) -> impl Future<Output = Result<(), JoinError>> + Send {
++    struct NotifyClosed(Option<ClientObserver>);
++    impl Drop for NotifyClosed {
++        fn drop(&mut self) {
++            if let Some(observer) = &self.0 {
++                observer(ClientEvent::Closed);
++            }
++        }
++    }
++    // Construct the guard before spawning: the last client can be dropped
++    // before this future is polled for the first time.
++    let notify_closed = NotifyClosed(observer.clone());
++    async move {
++        let _notify_closed = notify_closed;
++        // Cancel the whole loop, including a pending auth callback or send. Closing
++        // must not wait for another application request to reach the worker queue.
++        let result = AssertUnwindSafe(async {
++            tokio::select! { biased;
++                _ = shutdown.changed() => {},
++                never = run(
++                    protocol_response_receiver,
++                    client_request_receiver,
++                    watch_sender,
++                    base_client,
++                    &mut protocol_manager,
++                    observer,
++                ) => match never {},
++            }
++        })
++        .catch_unwind()
++        .await;
++        // Preserve the panic after joining the transport. Unwinding directly
++        // would only request its abort, allowing close to finish too early.
++        let closed = protocol_manager.close().await;
++        if let Err(panic) = result {
++            resume_unwind(panic);
++        }
++        closed
++    }
++}
++
++async fn run<T: SyncProtocol>(
+     mut protocol_response_receiver: mpsc::Receiver<ProtocolResponse>,
+     mut client_request_receiver: mpsc::UnboundedReceiver<ClientRequest>,
+     mut watch_sender: broadcast::Sender<QueryResults>,
+     mut base_client: BaseConvexClient,
+-    mut protocol_manager: T,
++    protocol_manager: &mut T,
++    observer: Option<ClientObserver>,
+ ) -> Infallible {
+     let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
+     loop {
+@@ -91,7 +154,8 @@ pub async fn worker<T: SyncProtocol>(
+                 &mut client_request_receiver,
+                 &mut watch_sender,
+                 &mut base_client,
+-                &mut protocol_manager,
++                protocol_manager,
++                observer.as_ref(),
+             )
+             .await
+             {
+@@ -100,6 +164,12 @@ pub async fn worker<T: SyncProtocol>(
+             }
+         };
+ 
++        if let Some(observer) = &observer {
++            // A protocol/auth failure also invalidates the view before any
++            // reconnect backoff, even when the transport socket remains open.
++            observer(ClientEvent::ConnectionState(WebSocketState::Connecting));
++        }
++
+         let delay = backoff.fail(&mut rand::rng());
+         tracing::error!(
+             "Convex Client Worker failed: {e:?}. Backing off for {delay:?} and retrying."
+@@ -128,6 +198,7 @@ async fn _worker_once<T: SyncProtocol>(
+     watch_sender: &mut broadcast::Sender<QueryResults>,
+     base_client: &mut BaseConvexClient,
+     protocol_manager: &mut T,
++    observer: Option<&ClientObserver>,
+ ) -> Result<(), ReconnectProtocolReason> {
+     // If there are any outgoing messages to flush (e.g. from an outer reconnect),
+     // do so first.
+@@ -136,12 +207,13 @@ async fn _worker_once<T: SyncProtocol>(
+         protocol_response_receiver,
+         watch_sender,
+         protocol_manager,
++        observer,
+     )
+     .await?;
+ 
+     tokio::select! {
+         Some(protocol_response) = protocol_response_receiver.recv() => {
+-            handle_protocol_response(base_client, watch_sender, protocol_response)?;
++            handle_protocol_response(base_client, watch_sender, protocol_response, observer)?;
+         }
+         Some(client_request) = client_request_receiver.recv() => {
+             match client_request {
+@@ -157,6 +229,7 @@ async fn _worker_once<T: SyncProtocol>(
+                         protocol_response_receiver,
+                         watch_sender,
+                         protocol_manager,
++                        observer,
+                     )
+                     .await?;
+ 
+@@ -181,6 +254,7 @@ async fn _worker_once<T: SyncProtocol>(
+                             protocol_response_receiver,
+                             watch_sender,
+                             protocol_manager,
++                            observer,
+                         )
+                         .await?;
+                     let _ = tx.send(result_receiver);
+@@ -197,6 +271,7 @@ async fn _worker_once<T: SyncProtocol>(
+                             protocol_response_receiver,
+                             watch_sender,
+                             protocol_manager,
++                            observer,
+                         )
+                         .await?;
+                     let _ = tx.send(result_receiver);
+@@ -209,6 +284,7 @@ async fn _worker_once<T: SyncProtocol>(
+                         protocol_response_receiver,
+                         watch_sender,
+                         protocol_manager,
++                        observer,
+                     )
+                     .await?;
+                 },
+@@ -219,6 +295,7 @@ async fn _worker_once<T: SyncProtocol>(
+                         protocol_response_receiver,
+                         watch_sender,
+                         protocol_manager,
++                        observer,
+                     )
+                     .await?;
+                 },
+@@ -237,6 +314,7 @@ async fn communicate<P: SyncProtocol>(
+     protocol_response_receiver: &mut mpsc::Receiver<ProtocolResponse>,
+     watch_sender: &mut broadcast::Sender<QueryResults>,
+     protocol: &mut P,
++    observer: Option<&ClientObserver>,
+ ) -> Result<(), ReconnectProtocolReason> {
+     while let Some(modification) = base_client.pop_next_message() {
+         let mut send_future = protocol.send(modification);
+@@ -246,7 +324,9 @@ async fn communicate<P: SyncProtocol>(
+                // Keep processing protocol responses while waiting so that we
+                // don't deadlock with the websocket worker.
+                Some(protocol_response) = protocol_response_receiver.recv() => {
+-                   handle_protocol_response(base_client, watch_sender, protocol_response)?;
++                   handle_protocol_response(
++                       base_client, watch_sender, protocol_response, observer,
++                   )?;
+                }
+             }
+         }
+@@ -258,10 +338,16 @@ fn handle_protocol_response(
+     base_client: &mut BaseConvexClient,
+     watch_sender: &mut broadcast::Sender<QueryResults>,
+     protocol_response: ProtocolResponse,
++    observer: Option<&ClientObserver>,
+ ) -> Result<(), ReconnectProtocolReason> {
+     match protocol_response {
+         ProtocolResponse::ServerMessage(msg) => {
+             if let Some(subscriber_id_to_latest_value) = base_client.receive_message(msg)? {
++                if let Some(observer) = observer {
++                    observer(ClientEvent::QueryResults(
++                        subscriber_id_to_latest_value.clone(),
++                    ));
++                }
+                 // Notify watchers of the new consistent query results at new timestamp
+                 let _ = watch_sender.send(subscriber_id_to_latest_value);
+             }
+diff --git a/src/lib.rs b/src/lib.rs
+index f87b14bc321c18511b1f80a77f9acfc3c05af77b..d36d792b3d8dffff106853bed9224f92fe09b034 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -55,6 +55,7 @@ pub use client::{
+         QuerySetSubscription,
+         QuerySubscription,
+     },
++    ClientEvent,
+     ConvexClient,
+     ConvexClientBuilder,
+ };
+diff --git a/src/sync/mod.rs b/src/sync/mod.rs
+index d61d360897cc465155be044f22f1fb335ae47faa..d66271983ea9e1e8b9b8585901f2e8cebf76bf1c 100644
+--- a/src/sync/mod.rs
++++ b/src/sync/mod.rs
+@@ -6,7 +6,10 @@ use convex_sync_types::{
+ use tokio::sync::mpsc;
+ use url::Url;
+ 
+-use crate::value::Value;
++use crate::{
++    client::ClientObserver,
++    value::Value,
++};
+ 
+ #[cfg(any(test, feature = "testing"))]
+ pub mod testing;
+@@ -30,8 +33,8 @@ pub enum ProtocolResponse {
+     Failure,
+ }
+ 
+-#[derive(Debug)]
+ /// The state of the Convex WebSocket connection
++#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+ pub enum WebSocketState {
+     /// The WebSocket is open and connected
+     Connected,
+@@ -46,7 +49,13 @@ pub trait SyncProtocol: Send + Sized {
+         on_response: mpsc::Sender<ProtocolResponse>,
+         on_state_change: Option<mpsc::Sender<WebSocketState>>,
+         client_id: &str,
++        observer: Option<ClientObserver>,
+     ) -> anyhow::Result<Self>;
+     async fn send(&mut self, message: ClientMessage) -> anyhow::Result<()>;
+     async fn reconnect(&mut self, request: ReconnectRequest);
++
++    /// Stop owned transport tasks before completing client shutdown.
++    async fn close(&mut self) -> Result<(), tokio::task::JoinError> {
++        Ok(())
++    }
+ }
+diff --git a/src/sync/web_socket_manager.rs b/src/sync/web_socket_manager.rs
+index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162fddfa59df 100644
+--- a/src/sync/web_socket_manager.rs
++++ b/src/sync/web_socket_manager.rs
+@@ -50,11 +50,17 @@ use url::Url;
+ use uuid::Uuid;
+ 
+ use super::WebSocketState;
+-use crate::sync::{
+-    ProtocolResponse,
+-    ReconnectRequest,
+-    ServerMessage,
+-    SyncProtocol,
++use crate::{
++    client::{
++        ClientEvent,
++        ClientObserver,
++    },
++    sync::{
++        ProtocolResponse,
++        ReconnectRequest,
++        ServerMessage,
++        SyncProtocol,
++    },
+ };
+ 
+ const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+@@ -75,12 +81,20 @@ struct WebSocketWorker {
+     ws_url: Url,
+     on_response: mpsc::Sender<ProtocolResponse>,
+     on_state_change: Option<mpsc::Sender<WebSocketState>>,
++    observer: Option<ClientObserver>,
+     internal_receiver: Fuse<UnboundedReceiverStream<WebSocketRequest>>,
+     ping_ticker: Interval,
+     connection_count: u32,
+     session_id: SessionId,
+     backoff: Backoff,
+ }
++impl Drop for WebSocketWorker {
++    fn drop(&mut self) {
++        // Cancellation and an unexpected task failure also invalidate the
++        // connection, without relying on the query worker making progress.
++        self.notify_state(WebSocketState::Connecting);
++    }
++}
+ 
+ pub struct WebSocketManager {
+     internal_sender: mpsc::UnboundedSender<WebSocketRequest>,
+@@ -99,17 +113,18 @@ impl SyncProtocol for WebSocketManager {
+         on_response: mpsc::Sender<ProtocolResponse>,
+         on_state_change: Option<mpsc::Sender<WebSocketState>>,
+         client_id: &str,
++        observer: Option<ClientObserver>,
+     ) -> anyhow::Result<Self> {
+         let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
+         let worker_handle = tokio::spawn(WebSocketWorker::run(
+             ws_url,
+             on_response,
+             on_state_change,
++            observer,
+             internal_receiver,
+             client_id.to_string(),
+         ));
+-
+-        Ok(WebSocketManager {
++        Ok(Self {
+             internal_sender,
+             worker_handle,
+         })
+@@ -128,6 +143,15 @@ impl SyncProtocol for WebSocketManager {
+             .internal_sender
+             .send(WebSocketRequest::Reconnect(request));
+     }
++
++    async fn close(&mut self) -> Result<(), tokio::task::JoinError> {
++        self.worker_handle.abort();
++        match (&mut self.worker_handle).await {
++            Ok(never) => match never {},
++            Err(error) if error.is_cancelled() => Ok(()),
++            Err(error) => Err(error),
++        }
++    }
+ }
+ 
+ impl WebSocketWorker {
+@@ -136,10 +160,21 @@ impl WebSocketWorker {
+     /// How long before lack of server response causes a timeout.
+     const SERVER_INACTIVITY_THRESHOLD: Duration = Duration::from_secs(30);
+ 
++    fn notify_state(&self, state: WebSocketState) {
++        // Observer delivery must not depend on capacity in the legacy channel.
++        if let Some(observer) = &self.observer {
++            observer(ClientEvent::ConnectionState(state));
++        }
++        if let Some(sender) = &self.on_state_change {
++            let _ = sender.try_send(state);
++        }
++    }
++
+     async fn run(
+         ws_url: Url,
+         on_response: mpsc::Sender<ProtocolResponse>,
+         on_state_change: Option<mpsc::Sender<WebSocketState>>,
++        observer: Option<ClientObserver>,
+         internal_receiver: mpsc::UnboundedReceiver<WebSocketRequest>,
+         client_id: String,
+     ) -> Infallible {
+@@ -150,6 +185,7 @@ impl WebSocketWorker {
+             ws_url,
+             on_response,
+             on_state_change,
++            observer,
+             internal_receiver: UnboundedReceiverStream::new(internal_receiver).fuse(),
+             ping_ticker,
+             connection_count: 0,
+@@ -161,17 +197,13 @@ impl WebSocketWorker {
+ 
+         let mut last_close_reason = "InitialConnect".to_string();
+         let mut max_observed_timestamp = None;
+-        if let Some(state_change_sender) = &worker.on_state_change {
+-            let _ = state_change_sender.try_send(WebSocketState::Connecting);
+-        }
++        worker.notify_state(WebSocketState::Connecting);
+         loop {
+             let exit_result = worker
+                 .work(last_close_reason, max_observed_timestamp, &client_id)
+                 .await;
+ 
+-            if let Some(state_change_sender) = &worker.on_state_change {
+-                let _ = state_change_sender.try_send(WebSocketState::Connecting);
+-            }
++            worker.notify_state(WebSocketState::Connecting);
+ 
+             let e = match exit_result {
+                 Ok(reconnect) => {
+@@ -237,9 +269,7 @@ impl WebSocketWorker {
+         )
+         .await?;
+         tracing::debug!("completed websocket {verb} to {}", self.ws_url);
+-        if let Some(state_change_sender) = &self.on_state_change {
+-            let _ = state_change_sender.try_send(WebSocketState::Connected);
+-        }
++        self.notify_state(WebSocketState::Connected);
+ 
+         loop {
+             select_biased! {
+diff --git a/tests/observation.rs b/tests/observation.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7def22b686672ba39323fb923a707c969ba9553
+--- /dev/null
++++ b/tests/observation.rs
+@@ -0,0 +1,344 @@
++use std::{
++    collections::BTreeMap,
++    sync::{
++        atomic::{
++            AtomicBool,
++            Ordering,
++        },
++        Arc,
++    },
++    task::Poll,
++    time::Duration,
++};
++
++use anyhow::Context;
++use convex::{
++    ClientEvent,
++    ConvexClientBuilder,
++    FunctionResult,
++    Value,
++    WebSocketState,
++};
++use convex_sync_types::{
++    ClientMessage,
++    LogLinesMessage,
++    QuerySetModification,
++    ServerMessage,
++    StateModification,
++    StateVersion,
++};
++use futures::{
++    poll,
++    SinkExt,
++    StreamExt,
++};
++use tokio::{
++    net::{
++        TcpListener,
++        TcpStream,
++    },
++    sync::mpsc,
++    time::timeout,
++};
++use tokio_tungstenite::{
++    accept_async,
++    tungstenite::Message,
++    WebSocketStream,
++};
++
++async fn receive(socket: &mut WebSocketStream<TcpStream>) -> anyhow::Result<ClientMessage> {
++    let Message::Text(text) = socket.next().await.context("Client disconnected")?? else {
++        anyhow::bail!("Expected text message");
++    };
++    serde_json::from_str::<serde_json::Value>(&text)?.try_into()
++}
++
++#[tokio::test]
++async fn last_client_drop_before_first_worker_poll_notifies_closed() -> anyhow::Result<()> {
++    let listener = TcpListener::bind("127.0.0.1:0").await?;
++    let (observed, mut events) = mpsc::unbounded_channel();
++    let client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++        .with_observer(move |event| {
++            let _ = observed.send(event);
++        })
++        .build()
++        .await?;
++    // This current-thread task has not yielded since spawning either SDK task.
++    drop(client);
++    timeout(Duration::from_secs(5), async {
++        while let Some(event) = events.recv().await {
++            if matches!(event, ClientEvent::Closed) {
++                return Ok(());
++            }
++        }
++        anyhow::bail!("Missing close event before first worker poll");
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn cancelled_close_waiter_preserves_shared_shutdown_and_ends_pending_query(
++) -> anyhow::Result<()> {
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .build()
++            .await?;
++        let (stream, _) = listener.accept().await?;
++        let mut socket = accept_async(stream).await?;
++        let mut querying_client = client.clone();
++        let query =
++            tokio::spawn(async move { querying_client.query("test:value", BTreeMap::new()).await });
++        while !matches!(
++            receive(&mut socket).await?,
++            ClientMessage::ModifyQuerySet { .. }
++        ) {}
++        let mut clone = client.clone();
++        // A later subscription reply proves the query's subscription was handed
++        // off, so shutdown exercises its empty stream rather than a send error.
++        let mut subscription = clone.subscribe("test:value", BTreeMap::new()).await?;
++        let mut first_close = Box::pin(client.close());
++        // Poll shutdown once without yielding to the worker, then cancel only
++        // this waiter. Another clone must still join the same shutdown.
++        assert!(matches!(poll!(&mut first_close), Poll::Pending));
++        drop(first_close);
++        clone.close().await?;
++        client.close().await?;
++        assert!(query.await?.is_err());
++        assert!(subscription.next().await.is_none());
++        assert!(clone
++            .subscribe("test:value", BTreeMap::new())
++            .await
++            .is_err());
++        Ok::<_, anyhow::Error>(())
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn close_after_query_worker_panic_joins_transport_and_retains_error() -> anyhow::Result<()> {
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let (observed, mut events) = mpsc::unbounded_channel();
++        let mut client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .with_observer(move |event| {
++                let _ = observed.send(event);
++            })
++            .build()
++            .await?;
++        let (stream, _) = listener.accept().await?;
++        let _socket = accept_async(stream).await?;
++        while !matches!(
++            events.recv().await.context("Observer closed")?,
++            ClientEvent::ConnectionState(WebSocketState::Connected)
++        ) {}
++        client
++            .set_auth_callback(Some(Box::new(|_| {
++                Box::pin(async { panic!("auth fixture failed") })
++            })))
++            .await;
++        // Transport teardown must precede query-task completion even on panic.
++        // The callback itself never panics or blocks.
++        assert!(matches!(
++            events.recv().await,
++            Some(ClientEvent::ConnectionState(WebSocketState::Connecting))
++        ));
++        assert!(matches!(events.recv().await, Some(ClientEvent::Closed)));
++        let first = client.close().await.unwrap_err();
++        let second = client.clone().close().await.unwrap_err();
++        let first = first
++            .downcast_ref::<Arc<tokio::task::JoinError>>()
++            .context("Missing worker panic")?;
++        let second = second
++            .downcast_ref::<Arc<tokio::task::JoinError>>()
++            .context("Missing shared worker panic")?;
++        assert!(first.is_panic());
++        assert!(Arc::ptr_eq(first, second));
++        Ok::<_, anyhow::Error>(())
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn observer_preserves_transitions_and_detects_application_overflow() -> anyhow::Result<()> {
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let (events, mut observations) = mpsc::unbounded_channel();
++        let (bounded, mut queued) = mpsc::channel(1);
++        let revoked = Arc::new(AtomicBool::new(false));
++        let callback_revoked = revoked.clone();
++        let mut client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .with_observer(move |event| {
++                if let ClientEvent::QueryResults(results) = event {
++                    if bounded.try_send(results.clone()).is_err() {
++                        callback_revoked.store(true, Ordering::SeqCst);
++                    }
++                    events.send(results).unwrap();
++                }
++            })
++            .build()
++            .await?;
++        let mut latest = client.watch_all();
++        let (stream, _) = listener.accept().await?;
++        let mut socket = accept_async(stream).await?;
++        assert!(matches!(
++            receive(&mut socket).await?,
++            ClientMessage::Connect { .. }
++        ));
++        let subscription = client.subscribe("test:value", BTreeMap::new()).await?;
++        let (query_id, query_set) = loop {
++            if let ClientMessage::ModifyQuerySet {
++                new_version,
++                modifications,
++                ..
++            } = receive(&mut socket).await?
++            {
++                if let Some(QuerySetModification::Add(query)) = modifications.into_iter().next() {
++                    break (query.query_id, new_version);
++                }
++            }
++        };
++        let mut version = StateVersion::initial();
++        for value in [1_i64, 2, 1] {
++            let next = StateVersion {
++                query_set,
++                ts: version.ts.succ()?,
++                ..version
++            };
++            let message = ServerMessage::Transition {
++                start_version: version,
++                end_version: next,
++                modifications: vec![StateModification::QueryUpdated {
++                    query_id,
++                    value: Value::Int64(value),
++                    journal: None,
++                    log_lines: LogLinesMessage(vec![]),
++                }],
++                client_clock_skew: None,
++                server_ts: None,
++            };
++            socket
++                .send(Message::Text(
++                    serde_json::Value::from(message).to_string().into(),
++                ))
++                .await?;
++            let received = observations.recv().await.context("Observer closed")?;
++            assert_eq!(
++                received.get(subscription.id()),
++                Some(&FunctionResult::Value(Value::Int64(value)))
++            );
++            version = next;
++        }
++        assert!(revoked.load(Ordering::SeqCst));
++        assert_eq!(
++            queued.recv().await.unwrap().get(subscription.id()),
++            Some(&FunctionResult::Value(Value::Int64(1)))
++        );
++        assert_eq!(
++            latest.next().await.unwrap().get(subscription.id()),
++            Some(&FunctionResult::Value(Value::Int64(1)))
++        );
++        client.close().await?;
++        assert!(latest.next().await.is_none());
++        Ok::<_, anyhow::Error>(())
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn observer_detects_disconnect_when_legacy_state_channel_is_full() -> anyhow::Result<()> {
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let (legacy, mut legacy_receiver) = mpsc::channel(1);
++        let (observed, mut events) = mpsc::unbounded_channel();
++        let revoked = Arc::new(AtomicBool::new(false));
++        let callback_revoked = revoked.clone();
++        let connected = AtomicBool::new(false);
++        let client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .with_on_state_change(legacy)
++            .with_observer(move |event| {
++                match &event {
++                    ClientEvent::ConnectionState(WebSocketState::Connected) => {
++                        connected.store(true, Ordering::SeqCst);
++                    },
++                    ClientEvent::ConnectionState(WebSocketState::Connecting)
++                        if connected.load(Ordering::SeqCst) =>
++                    {
++                        callback_revoked.store(true, Ordering::SeqCst);
++                    },
++                    ClientEvent::Closed => {
++                        callback_revoked.store(true, Ordering::SeqCst);
++                    },
++                    ClientEvent::ConnectionState(WebSocketState::Connecting)
++                    | ClientEvent::QueryResults(_) => {},
++                }
++                observed.send(event).unwrap();
++            })
++            .build()
++            .await?;
++        let (stream, _) = listener.accept().await?;
++        let mut socket = accept_async(stream).await?;
++        while !matches!(
++            events.recv().await.context("Observer closed")?,
++            ClientEvent::ConnectionState(WebSocketState::Connected)
++        ) {}
++        socket.close(None).await?;
++        assert!(matches!(
++            events.recv().await,
++            Some(ClientEvent::ConnectionState(WebSocketState::Connecting))
++        ));
++        assert_eq!(
++            legacy_receiver.recv().await,
++            Some(WebSocketState::Connecting)
++        );
++        // The initial legacy Connecting occupied its only slot. Both Connected
++        // and the disconnect notification were dropped before it was drained.
++        assert!(revoked.load(Ordering::SeqCst));
++        let (stream, _) = listener.accept().await?;
++        let _replacement_socket = accept_async(stream).await?;
++        while !matches!(
++            events.recv().await.context("Observer closed")?,
++            ClientEvent::ConnectionState(WebSocketState::Connected)
++        ) {}
++        assert!(revoked.load(Ordering::SeqCst));
++        let clone = client.clone();
++        let (first, second) = tokio::join!(client.close(), clone.close());
++        first?;
++        second?;
++        while let Some(event) = events.recv().await {
++            if matches!(event, ClientEvent::Closed) {
++                return Ok::<_, anyhow::Error>(());
++            }
++        }
++        anyhow::bail!("Missing close event");
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn close_cancels_pending_auth_and_waits_for_socket_drop() -> anyhow::Result<()> {
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let mut client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .build()
++            .await?;
++        let (stream, _) = listener.accept().await?;
++        let mut socket = accept_async(stream).await?;
++        let (entered, mut started) = mpsc::channel(1);
++        client
++            .set_auth_callback(Some(Box::new(move |_| {
++                entered.try_send(()).unwrap();
++                Box::pin(std::future::pending())
++            })))
++            .await;
++        started.recv().await.context("Auth did not start")?;
++        client.close().await?;
++        while let Some(message) = socket.next().await {
++            if message.is_err() || matches!(message?, Message::Close(_)) {
++                return Ok::<_, anyhow::Error>(());
++            }
++        }
++        Ok(())
++    })
++    .await?
++}
