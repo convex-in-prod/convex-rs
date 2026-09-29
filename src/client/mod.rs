@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    convert::Infallible,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -13,14 +12,26 @@ use convex_sync_types::{
 };
 #[cfg(doc)]
 use futures::Stream;
-use futures::StreamExt;
+use futures::{
+    future::{
+        BoxFuture,
+        Shared,
+    },
+    FutureExt,
+    StreamExt,
+};
 use tokio::{
     sync::{
         broadcast,
         mpsc,
         oneshot,
+        watch,
     },
-    task::JoinHandle,
+    task::{
+        AbortHandle,
+        JoinError,
+        JoinHandle,
+    },
 };
 use tokio_stream::wrappers::BroadcastStream;
 use url::Url;
@@ -60,6 +71,50 @@ mod worker;
 
 const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 
+/// An observation from the client's background tasks.
+///
+/// Query results are delivered in protocol order without local coalescing. They
+/// are consistent snapshots, not a record of every database transaction.
+pub enum ClientEvent {
+    /// A completed query-set transition received from the server.
+    /// Pending subscriptions can have no result yet. Adding a subscriber to a
+    /// cached query does not itself emit a transition.
+    QueryResults(QueryResults),
+    /// The transport connected or began connecting again. A connection alone
+    /// does not mean that the query set has caught up.
+    ConnectionState(WebSocketState),
+    /// The client worker stopped, including cancellation or failure.
+    Closed,
+}
+
+pub(crate) type ClientObserver = Arc<dyn Fn(ClientEvent) + Send + Sync>;
+
+struct ClientWorker {
+    shutdown: watch::Sender<bool>,
+    abort: AbortHandle,
+    closed: Shared<BoxFuture<'static, Result<(), Arc<JoinError>>>>,
+}
+
+impl ClientWorker {
+    fn new(handle: JoinHandle<Result<(), JoinError>>, shutdown: watch::Sender<bool>) -> Self {
+        let abort = handle.abort_handle();
+        let closed = async move { handle.await.unwrap_or_else(Err).map_err(Arc::new) }
+            .boxed()
+            .shared();
+        Self {
+            shutdown,
+            abort,
+            closed,
+        }
+    }
+}
+
+impl Drop for ClientWorker {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
 /// An asynchronous client to interact with a specific project to perform
 /// mutations and manage query subscriptions using [`tokio`].
 ///
@@ -89,7 +144,7 @@ const VERSION: Option<&str> = option_env!("CARGO_PKG_VERSION");
 /// ## Examples
 /// For example code, please refer to the examples directory.
 pub struct ConvexClient {
-    listen_handle: Option<Arc<JoinHandle<Infallible>>>,
+    worker: Arc<ClientWorker>,
     request_sender: mpsc::UnboundedSender<ClientRequest>,
     watch_receiver: broadcast::Receiver<QueryResults>,
 }
@@ -99,23 +154,9 @@ pub struct ConvexClient {
 impl Clone for ConvexClient {
     fn clone(&self) -> Self {
         Self {
-            listen_handle: self.listen_handle.clone(),
+            worker: self.worker.clone(),
             request_sender: self.request_sender.clone(),
             watch_receiver: self.watch_receiver.resubscribe(),
-        }
-    }
-}
-
-/// Drop the [`ConvexClient`]. When the final reference to the [`ConvexClient`]
-/// is dropped, the connection is cleaned up.
-impl Drop for ConvexClient {
-    fn drop(&mut self) {
-        if let Ok(j_handle) = Arc::try_unwrap(
-            self.listen_handle
-                .take()
-                .expect("INTERNAL BUG: listen handle should never be none"),
-        ) {
-            j_handle.abort()
         }
     }
 }
@@ -156,22 +197,41 @@ impl ConvexClient {
             response_sender,
             builder.on_state_change,
             client_id.as_str(),
+            builder.observer.clone(),
         )
         .await?;
 
+        let (shutdown, shutdown_receiver) = watch::channel(false);
         let listen_handle = tokio::spawn(worker(
             response_receiver,
             request_receiver,
             watch_sender,
             base_client,
             protocol,
+            builder.observer,
+            shutdown_receiver,
         ));
         let client = ConvexClient {
-            listen_handle: Some(Arc::new(listen_handle)),
+            worker: Arc::new(ClientWorker::new(listen_handle, shutdown)),
             request_sender,
             watch_receiver,
         };
         Ok(client)
+    }
+
+    /// Stop this shared client and wait for both background tasks to finish.
+    ///
+    /// This closes all clones and their subscriptions. Concurrent calls are
+    /// allowed, and canceling a caller does not cancel shared shutdown. Streams
+    /// can still yield already buffered results before ending. Dropping the
+    /// last client requests cancellation without waiting. Closing cannot
+    /// undo a mutation already submitted.
+    ///
+    /// Subsequent requests return errors. Auth setters retain their infallible
+    /// signatures and panic when called after shutdown.
+    pub async fn close(&self) -> anyhow::Result<()> {
+        self.worker.shutdown.send_replace(true);
+        self.worker.closed.clone().await.map_err(anyhow::Error::new)
     }
 
     /// Subscribe to the results of query `name` called with `args`.
@@ -238,12 +298,11 @@ impl ConvexClient {
         name: &str,
         args: BTreeMap<String, Value>,
     ) -> anyhow::Result<FunctionResult> {
-        Ok(self
-            .subscribe(name, args)
+        self.subscribe(name, args)
             .await?
             .next()
             .await
-            .expect("INTERNAL BUG: Convex Client dropped prematurely."))
+            .ok_or_else(|| anyhow::anyhow!("Client closed before query completed"))
     }
 
     /// Perform a mutation `name` with `args` and return a future
@@ -318,6 +377,9 @@ impl ConvexClient {
     /// implements [`Stream`]<[`QueryResults`]>.
     /// Each item in the stream contains a consistent view
     /// of the results of all the queries in the query set.
+    /// Slow consumers can skip intermediate snapshots. Use
+    /// [`ConvexClientBuilder::with_observer`] to observe each received
+    /// transition.
     ///
     /// Queries can be added to the query set via [`ConvexClient::subscribe`].
     /// Queries can be removed from the query set via dropping the
@@ -373,7 +435,7 @@ impl ConvexClient {
         });
         self.request_sender
             .send(ClientRequest::Authenticate(fetcher))
-            .expect("INTERNAL BUG: Worker has gone away");
+            .expect("Client is closed");
     }
 
     /// Set an auth token fetcher callback for use when calling Convex
@@ -387,7 +449,7 @@ impl ConvexClient {
     pub async fn set_auth_callback(&mut self, fetcher: Option<AuthTokenFetcher>) {
         self.request_sender
             .send(ClientRequest::Authenticate(fetcher))
-            .expect("INTERNAL BUG: Worker has gone away");
+            .expect("Client is closed");
     }
 
     /// Set admin auth for use when calling Convex functions as a deployment
@@ -409,7 +471,7 @@ impl ConvexClient {
         });
         self.request_sender
             .send(ClientRequest::Authenticate(Some(fetcher)))
-            .expect("INTERNAL BUG: Worker has gone away");
+            .expect("Client is closed");
     }
 }
 
@@ -431,6 +493,7 @@ pub struct ConvexClientBuilder {
     deployment_url: String,
     client_id: Option<String>,
     on_state_change: Option<mpsc::Sender<WebSocketState>>,
+    observer: Option<ClientObserver>,
 }
 
 impl ConvexClientBuilder {
@@ -440,6 +503,7 @@ impl ConvexClientBuilder {
             deployment_url: deployment_url.to_string(),
             client_id: None,
             on_state_change: None,
+            observer: None,
         }
     }
 
@@ -450,9 +514,29 @@ impl ConvexClientBuilder {
     }
 
     /// Set a channel to be notified of changes to the WebSocket connection
-    /// state.
+    /// state. Notifications are best effort and are dropped when the channel is
+    /// full. Use [`Self::with_observer`] when every connection change matters.
     pub fn with_on_state_change(mut self, on_state_change: mpsc::Sender<WebSocketState>) -> Self {
         self.on_state_change = Some(on_state_change);
+        self
+    }
+
+    /// Observe each query-set transition and connection change without an
+    /// intermediate SDK queue. The observer is installed before tasks start.
+    ///
+    /// The callback must not block or panic. It may run concurrently on the
+    /// connection and query workers; query-result callbacks remain ordered.
+    /// A bounded application queue must detect overflow itself. For example,
+    /// revoke a consumer's lifetime synchronously if enqueueing fails or a
+    /// connection becomes unavailable, and never restore it on reconnect.
+    ///
+    /// Initial connection state is `Connecting`; repeated state notifications
+    /// are possible. Results received before disconnect can still be in flight
+    /// when the connection notification arrives. Fence those results in the
+    /// application. Shutdown can discard unapplied messages before `Closed`.
+    /// This API does not make query subscriptions a change log.
+    pub fn with_observer(mut self, observer: impl Fn(ClientEvent) + Send + Sync + 'static) -> Self {
+        self.observer = Some(Arc::new(observer));
         self
     }
 
@@ -502,7 +586,10 @@ pub mod tests {
         mpsc,
     };
 
-    use super::ConvexClient;
+    use super::{
+        ClientWorker,
+        ConvexClient,
+    };
     use crate::{
         base_client::FunctionResult,
         client::{
@@ -537,20 +624,24 @@ pub mod tests {
                 response_sender,
                 None,
                 "rust-0.0.1",
+                None,
             )
             .await?;
             let base_client = BaseConvexClient::new();
 
+            let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
             let listen_handle = tokio::spawn(worker(
                 response_receiver,
                 request_receiver,
                 watch_sender,
                 base_client,
                 test_protocol.clone(),
+                None,
+                shutdown_receiver,
             ));
 
             let client = ConvexClient {
-                listen_handle: Some(Arc::new(listen_handle)),
+                worker: Arc::new(ClientWorker::new(listen_handle, shutdown)),
                 request_sender,
                 watch_receiver,
             };

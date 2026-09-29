@@ -1,5 +1,5 @@
 use std::{
-    convert::Infallible,
+    ops::ControlFlow,
     time::Duration,
 };
 
@@ -50,11 +50,17 @@ use url::Url;
 use uuid::Uuid;
 
 use super::WebSocketState;
-use crate::sync::{
-    ProtocolResponse,
-    ReconnectRequest,
-    ServerMessage,
-    SyncProtocol,
+use crate::{
+    client::{
+        ClientEvent,
+        ClientObserver,
+    },
+    sync::{
+        ProtocolResponse,
+        ReconnectRequest,
+        ServerMessage,
+        SyncProtocol,
+    },
 };
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -75,16 +81,24 @@ struct WebSocketWorker {
     ws_url: Url,
     on_response: mpsc::Sender<ProtocolResponse>,
     on_state_change: Option<mpsc::Sender<WebSocketState>>,
+    observer: Option<ClientObserver>,
     internal_receiver: Fuse<UnboundedReceiverStream<WebSocketRequest>>,
     ping_ticker: Interval,
     connection_count: u32,
     session_id: SessionId,
     backoff: Backoff,
 }
+impl Drop for WebSocketWorker {
+    fn drop(&mut self) {
+        // Cancellation and an unexpected task failure also invalidate the
+        // connection, without relying on the query worker making progress.
+        self.notify_state(WebSocketState::Connecting);
+    }
+}
 
 pub struct WebSocketManager {
     internal_sender: mpsc::UnboundedSender<WebSocketRequest>,
-    worker_handle: JoinHandle<Infallible>,
+    worker_handle: JoinHandle<()>,
 }
 impl Drop for WebSocketManager {
     fn drop(&mut self) {
@@ -99,17 +113,18 @@ impl SyncProtocol for WebSocketManager {
         on_response: mpsc::Sender<ProtocolResponse>,
         on_state_change: Option<mpsc::Sender<WebSocketState>>,
         client_id: &str,
+        observer: Option<ClientObserver>,
     ) -> anyhow::Result<Self> {
         let (internal_sender, internal_receiver) = mpsc::unbounded_channel();
         let worker_handle = tokio::spawn(WebSocketWorker::run(
             ws_url,
             on_response,
             on_state_change,
+            observer,
             internal_receiver,
             client_id.to_string(),
         ));
-
-        Ok(WebSocketManager {
+        Ok(Self {
             internal_sender,
             worker_handle,
         })
@@ -128,6 +143,15 @@ impl SyncProtocol for WebSocketManager {
             .internal_sender
             .send(WebSocketRequest::Reconnect(request));
     }
+
+    async fn close(&mut self) -> Result<(), tokio::task::JoinError> {
+        self.worker_handle.abort();
+        match (&mut self.worker_handle).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl WebSocketWorker {
@@ -136,13 +160,24 @@ impl WebSocketWorker {
     /// How long before lack of server response causes a timeout.
     const SERVER_INACTIVITY_THRESHOLD: Duration = Duration::from_secs(30);
 
+    fn notify_state(&self, state: WebSocketState) {
+        // Observer delivery must not depend on capacity in the legacy channel.
+        if let Some(observer) = &self.observer {
+            observer(ClientEvent::ConnectionState(state));
+        }
+        if let Some(sender) = &self.on_state_change {
+            let _ = sender.try_send(state);
+        }
+    }
+
     async fn run(
         ws_url: Url,
         on_response: mpsc::Sender<ProtocolResponse>,
         on_state_change: Option<mpsc::Sender<WebSocketState>>,
+        observer: Option<ClientObserver>,
         internal_receiver: mpsc::UnboundedReceiver<WebSocketRequest>,
         client_id: String,
-    ) -> Infallible {
+    ) {
         let ping_ticker = tokio::time::interval(Self::HEARTBEAT_INTERVAL);
         let backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
 
@@ -150,6 +185,7 @@ impl WebSocketWorker {
             ws_url,
             on_response,
             on_state_change,
+            observer,
             internal_receiver: UnboundedReceiverStream::new(internal_receiver).fuse(),
             ping_ticker,
             connection_count: 0,
@@ -161,20 +197,17 @@ impl WebSocketWorker {
 
         let mut last_close_reason = "InitialConnect".to_string();
         let mut max_observed_timestamp = None;
-        if let Some(state_change_sender) = &worker.on_state_change {
-            let _ = state_change_sender.try_send(WebSocketState::Connecting);
-        }
+        worker.notify_state(WebSocketState::Connecting);
         loop {
             let exit_result = worker
                 .work(last_close_reason, max_observed_timestamp, &client_id)
                 .await;
 
-            if let Some(state_change_sender) = &worker.on_state_change {
-                let _ = state_change_sender.try_send(WebSocketState::Connecting);
-            }
+            worker.notify_state(WebSocketState::Connecting);
 
             let e = match exit_result {
-                Ok(reconnect) => {
+                Ok(ControlFlow::Break(())) => return,
+                Ok(ControlFlow::Continue(reconnect)) => {
                     // WS worker exited cleanly because it got a request to reconnect
                     tracing::debug!("Reconnecting websocket due to {}", reconnect.reason);
                     last_close_reason = reconnect.reason;
@@ -197,12 +230,16 @@ impl WebSocketWorker {
             let _ = worker.on_response.send(ProtocolResponse::Failure).await;
             tracing::debug!("Waiting for base client to acknowledge reconnect");
             loop {
-                let request = worker.internal_receiver.next().await;
+                // A closed fused stream stays ready. Stop when its owner is gone
+                // so this drain cannot spin past task cancellation during shutdown.
+                let Some(request) = worker.internal_receiver.next().await else {
+                    return;
+                };
                 // TODO: There is a potential issue where we have multiple queued reconnect
                 // requests in which case max_observed_timestamp might be lower than actually
                 // observed. This is fine since it will never cause errors. Will can fix this
                 // when we restructure the wider protocol to be a single routine.
-                if let Some(WebSocketRequest::Reconnect(reconnect)) = request {
+                if let WebSocketRequest::Reconnect(reconnect) = request {
                     max_observed_timestamp = reconnect.max_observed_timestamp;
                     break;
                 }
@@ -220,7 +257,7 @@ impl WebSocketWorker {
         last_close_reason: String,
         max_seen_transition: Option<Timestamp>,
         client_id: &str,
-    ) -> anyhow::Result<ReconnectRequest> {
+    ) -> anyhow::Result<ControlFlow<(), ReconnectRequest>> {
         let verb = if self.connection_count == 0 {
             "connect"
         } else {
@@ -237,9 +274,7 @@ impl WebSocketWorker {
         )
         .await?;
         tracing::debug!("completed websocket {verb} to {}", self.ws_url);
-        if let Some(state_change_sender) = &self.on_state_change {
-            let _ = state_change_sender.try_send(WebSocketState::Connected);
-        }
+        self.notify_state(WebSocketState::Connected);
 
         loop {
             select_biased! {
@@ -282,7 +317,10 @@ impl WebSocketWorker {
                         },
                     }
                 },
-                request = self.internal_receiver.select_next_some() => {
+                request = self.internal_receiver.next().fuse() => {
+                    let Some(request) = request else {
+                        return Ok(ControlFlow::Break(()));
+                    };
                     match request {
                         WebSocketRequest::SendMessage(message, sender) => {
                             tracing::debug!("Sending {message:?}");
@@ -290,7 +328,9 @@ impl WebSocketWorker {
                             internal.send_worker(msg.clone()).await?;
                             let _ = sender.send(());
                         },
-                        WebSocketRequest::Reconnect(reason) => return Ok(reason),
+                        WebSocketRequest::Reconnect(reason) => {
+                            return Ok(ControlFlow::Continue(reason));
+                        },
                     };
                 }
             };

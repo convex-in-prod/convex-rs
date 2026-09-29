@@ -112,6 +112,9 @@ impl Stream for QuerySubscription {
 /// implements [`Stream`]<[`QueryResults`]>.
 /// Each item in the stream contains a consistent view
 /// of the results of all the queries in the query set.
+/// Intermediate snapshots can be skipped when the consumer lags. Use
+/// [`crate::ConvexClientBuilder::with_observer`] to observe every received
+/// query-set transition without local coalescing.
 ///
 /// Queries can be added to the query set via [`ConvexClient::subscribe`].
 /// Queries can be removed from the query set via dropping the

@@ -83,17 +83,24 @@ impl RequestManager {
     pub fn update_request(
         &mut self,
         request_id: &RequestId,
+        next_request_id: RequestId,
         request_type: RequestType,
         value: FunctionResult,
         ts: Option<Timestamp>,
     ) -> Result<(), ReconnectProtocolReason> {
         let Some((request, _)) = self.ongoing_requests.get_mut(request_id) else {
+            // A reconnect resends retained successful mutations. A transition can
+            // complete one before its repeated response arrives. Absent earlier
+            // IDs have completed; IDs not yet issued are still protocol errors.
+            if request_type == RequestType::Mutation && *request_id < next_request_id {
+                return Ok(());
+            }
             return Err("Invalid request id from server".to_string());
         };
         if request.typ != request_type {
             return Err("Mismatched request type from server".to_string());
         };
-        let errored = matches!(value, FunctionResult::ErrorMessage(_));
+        let errored = !matches!(value, FunctionResult::Value(_));
         request.update_value(value);
         request.update_timestamp(ts);
         request.status = RequestStatus::Completed;
@@ -108,16 +115,11 @@ impl RequestManager {
     pub fn remove_and_notify_completed(&mut self, ts: Timestamp) -> BTreeSet<RequestId> {
         let mut completed_requests = BTreeSet::new();
         for (id, (request, _)) in self.ongoing_requests.iter() {
-            let mut is_completed = false;
-            if request.status == RequestStatus::Completed {
-                is_completed = true;
-            }
-            if let Some(request_ts) = request.ts {
-                if request_ts <= ts {
-                    is_completed = true;
-                }
-            }
-            if is_completed {
+            // Successful mutations must wait until queries have observed their
+            // commit; an older transition can still be in flight at the response.
+            if request.status == RequestStatus::Completed
+                && request.ts.is_some_and(|request_ts| request_ts <= ts)
+            {
                 completed_requests.insert(*id);
             }
         }
