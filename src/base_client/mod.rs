@@ -681,6 +681,7 @@ impl BaseConvexClient {
                 let request_id = RequestId::new(request_id);
                 self.request_manager.update_request(
                     &request_id,
+                    RequestId::new(self.next_request_id),
                     RequestType::Mutation,
                     result.into(),
                     ts,
@@ -714,6 +715,7 @@ impl BaseConvexClient {
                 let request_id = RequestId::new(request_id);
                 self.request_manager.update_request(
                     &request_id,
+                    RequestId::new(self.next_request_id),
                     RequestType::Action,
                     result.into(),
                     None,

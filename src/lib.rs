@@ -55,6 +55,7 @@ pub use client::{
         QuerySetSubscription,
         QuerySubscription,
     },
+    ClientEvent,
     ConvexClient,
     ConvexClientBuilder,
 };

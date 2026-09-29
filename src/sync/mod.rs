@@ -6,7 +6,10 @@ use convex_sync_types::{
 use tokio::sync::mpsc;
 use url::Url;
 
-use crate::value::Value;
+use crate::{
+    client::ClientObserver,
+    value::Value,
+};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -30,8 +33,8 @@ pub enum ProtocolResponse {
     Failure,
 }
 
-#[derive(Debug)]
 /// The state of the Convex WebSocket connection
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum WebSocketState {
     /// The WebSocket is open and connected
     Connected,
@@ -46,7 +49,13 @@ pub trait SyncProtocol: Send + Sized {
         on_response: mpsc::Sender<ProtocolResponse>,
         on_state_change: Option<mpsc::Sender<WebSocketState>>,
         client_id: &str,
+        observer: Option<ClientObserver>,
     ) -> anyhow::Result<Self>;
     async fn send(&mut self, message: ClientMessage) -> anyhow::Result<()>;
     async fn reconnect(&mut self, request: ReconnectRequest);
+
+    /// Stop owned transport tasks before completing client shutdown.
+    async fn close(&mut self) -> Result<(), tokio::task::JoinError> {
+        Ok(())
+    }
 }
