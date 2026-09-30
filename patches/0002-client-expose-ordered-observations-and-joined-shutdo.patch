@@ -3,28 +3,61 @@ From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 30 Sep 2026 01:01:04 +0800
 Subject: [PATCH 2/2] client: expose ordered observations and joined shutdown
 
-Install a synchronous observer before workers start, report each received query-set transition and connection state, and report terminal closure without turning snapshots into a database change log. Keep the existing bounded state channel best effort so a full receiver cannot block reconnects or shutdown.
+Install a synchronous observer before workers start, report each received
+query-set transition and connection state, and report terminal closure
+without turning snapshots into a database change log. Keep the existing
+bounded state channel best effort so a full receiver cannot block
+reconnects or shutdown.
 
-Give cloned clients one cancellation-safe joined close operation covering both background tasks, retain final-drop cancellation, and preserve buffered stream and submitted-mutation semantics. Add local WebSocket lifecycle fixtures and document the replay, observation and distribution boundaries.
+Give cloned clients one cancellation-safe joined close operation covering
+both background tasks, retain final-drop cancellation, and preserve
+buffered stream and submitted-mutation semantics. A closed protocol
+response channel terminates the query worker and pending requests even
+with live client clones. Join the transport and retain its panic for close
+to report. End the transport when its request stream closes, including
+while it waits for reconnect acknowledgement.
+
+Preserve mutation visibility ordering: complete successful mutations only
+after a query transition reaches their commit timestamp. Complete plain
+and structured errors immediately and remove them from reconnect replay.
+Ignore legitimate late repeated mutation responses after completion while
+retaining future-ID and active request-type validation. These completion
+and duplicate-response corrections are independently authored.
+
+Adapt terminal worker progress handling from upstream PR #16:
+https://github.com/get-convex/convex-rs/pull/16
+Source commit: 8c0e01c56b4f7f507595ec2eddee22f19fc5e7d4
+Use transport closure as terminal within the existing shared shutdown
+owner rather than introducing a separate retry or task-lifecycle API.
+
+Add local WebSocket lifecycle, completion-order, late-response and terminal
+OCC fixtures. Document the replay, observation and immutable source
+revision distribution boundaries. The fixtures model successful-result
+retention; they do not establish real-backend deduplication retention.
+
+Co-authored-by: David Potgieter <2729962+david-potgieter@users.noreply.github.com>
 ---
- patches/README.md              |  43 +++++
- src/client/mod.rs              | 149 +++++++++++---
- src/client/subscription.rs     |   3 +
- src/client/worker.rs           | 104 +++++++++-
- src/lib.rs                     |   1 +
- src/sync/mod.rs                |  13 +-
- src/sync/web_socket_manager.rs |  62 ++++--
- tests/observation.rs           | 344 +++++++++++++++++++++++++++++++++
- 8 files changed, 663 insertions(+), 56 deletions(-)
+ patches/README.md                  |  62 ++++
+ src/base_client/mod.rs             |   2 +
+ src/base_client/request_manager.rs |  24 +-
+ src/client/mod.rs                  | 149 ++++++++--
+ src/client/subscription.rs         |   3 +
+ src/client/worker.rs               | 125 ++++++--
+ src/lib.rs                         |   1 +
+ src/sync/mod.rs                    |  13 +-
+ src/sync/web_socket_manager.rs     |  90 ++++--
+ tests/observation.rs               | 462 +++++++++++++++++++++++++++++
+ tests/reconnect.rs                 | 386 ++++++++++++++++++++++--
+ 11 files changed, 1213 insertions(+), 104 deletions(-)
  create mode 100644 patches/README.md
  create mode 100644 tests/observation.rs
 
 diff --git a/patches/README.md b/patches/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..6ef2e0e6d9efe174fb5902a1c8162baf30717f28
+index 0000000000000000000000000000000000000000..5861951e4b358ced05471e67a2df9b5a85a0fb1c
 --- /dev/null
 +++ b/patches/README.md
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,62 @@
 +# Maintained Rust client patches
 +
 +The source branch carries two patches over the reviewed upstream base. The orphan
@@ -37,6 +70,8 @@ index 0000000000000000000000000000000000000000..6ef2e0e6d9efe174fb5902a1c8162baf
 +mutations with their original request IDs. Separate clients retain independent
 +sessions. The server's successful-result lookup determines replay behavior; a stable
 +identity does not add a new client retry policy or extend server retention.
++
++Upstream proposal: [PR #17](https://github.com/get-convex/convex-rs/pull/17).
 +
 +## Ordered observation and joined shutdown
 +
@@ -51,6 +86,22 @@ index 0000000000000000000000000000000000000000..6ef2e0e6d9efe174fb5902a1c8162baf
 +cancellation without waiting. Already buffered subscription results may still be
 +read, and closing cannot undo a mutation submitted to the server.
 +
++A closed protocol response channel terminates the query worker and its pending
++requests even while client clones remain alive. Shared shutdown joins the transport
++and retains a transport panic for `close` to report. The transport also terminates
++when its request stream closes, including while waiting for reconnect acknowledgement.
++
++Successful mutations complete only after a query transition reaches their commit
++timestamp. Plain and structured mutation errors, including identified terminal OCC,
++complete immediately and leave the reconnect replay set. A late repeated mutation
++response after completion does not close the usable connection; IDs not yet issued
++and mismatched active request types remain protocol errors.
++
++Terminal worker progress handling adapts
++[PR #16](https://github.com/get-convex/convex-rs/pull/16) at
++`8c0e01c56b4f7f507595ec2eddee22f19fc5e7d4`. Completion ordering and late duplicate
++response handling were authored independently.
++
 +The existing connection-state channel is best effort and cannot block reconnect or
 +shutdown when full. Applications that need every received transition can use the
 +observer and explicitly handle their own bounded queues and lifetime fencing.
@@ -58,8 +109,9 @@ index 0000000000000000000000000000000000000000..6ef2e0e6d9efe174fb5902a1c8162baf
 +## Verification and distribution
 +
 +Local WebSocket fixtures cover ordered observation, slow/full notification consumers,
-+shutdown ownership and reconnect replay identity. They do not run a real backend or
-+prove transaction retention. The upstream package's testing feature references
++shutdown ownership, terminal transport failure, mutation completion ordering, late
++repeated responses, terminal OCC and reconnect replay identity. They do not run a real
++backend or prove transaction retention or server deduplication retention. The upstream package's testing feature references
 +omitted generated testing modules; the focused fixtures were also exercised through
 +a downstream harness importing the actual SDK sources.
 +
@@ -68,6 +120,78 @@ index 0000000000000000000000000000000000000000..6ef2e0e6d9efe174fb5902a1c8162baf
 +binary release. Preserve existing PR branches and published source references when
 +updating the maintained source train. Regenerate patch-history with the canonical
 +updater and verify it using that branch's `scripts/apply.sh`.
+diff --git a/src/base_client/mod.rs b/src/base_client/mod.rs
+index 306d5551324e98357f00a3f5aaf0495c467215b0..6f546d333c03552a1c3aec80dcf4f9dc9c300f6b 100644
+--- a/src/base_client/mod.rs
++++ b/src/base_client/mod.rs
+@@ -681,6 +681,7 @@ impl BaseConvexClient {
+                 let request_id = RequestId::new(request_id);
+                 self.request_manager.update_request(
+                     &request_id,
++                    RequestId::new(self.next_request_id),
+                     RequestType::Mutation,
+                     result.into(),
+                     ts,
+@@ -714,6 +715,7 @@ impl BaseConvexClient {
+                 let request_id = RequestId::new(request_id);
+                 self.request_manager.update_request(
+                     &request_id,
++                    RequestId::new(self.next_request_id),
+                     RequestType::Action,
+                     result.into(),
+                     None,
+diff --git a/src/base_client/request_manager.rs b/src/base_client/request_manager.rs
+index 8c461354f4f549dcb9a4bf43ef11310fc8c9adc2..b62614402e3f5c61134ef9b2600b557d0cd4ca2c 100644
+--- a/src/base_client/request_manager.rs
++++ b/src/base_client/request_manager.rs
+@@ -83,17 +83,24 @@ impl RequestManager {
+     pub fn update_request(
+         &mut self,
+         request_id: &RequestId,
++        next_request_id: RequestId,
+         request_type: RequestType,
+         value: FunctionResult,
+         ts: Option<Timestamp>,
+     ) -> Result<(), ReconnectProtocolReason> {
+         let Some((request, _)) = self.ongoing_requests.get_mut(request_id) else {
++            // A reconnect resends retained successful mutations. A transition can
++            // complete one before its repeated response arrives. Absent earlier
++            // IDs have completed; IDs not yet issued are still protocol errors.
++            if request_type == RequestType::Mutation && *request_id < next_request_id {
++                return Ok(());
++            }
+             return Err("Invalid request id from server".to_string());
+         };
+         if request.typ != request_type {
+             return Err("Mismatched request type from server".to_string());
+         };
+-        let errored = matches!(value, FunctionResult::ErrorMessage(_));
++        let errored = !matches!(value, FunctionResult::Value(_));
+         request.update_value(value);
+         request.update_timestamp(ts);
+         request.status = RequestStatus::Completed;
+@@ -108,16 +115,11 @@ impl RequestManager {
+     pub fn remove_and_notify_completed(&mut self, ts: Timestamp) -> BTreeSet<RequestId> {
+         let mut completed_requests = BTreeSet::new();
+         for (id, (request, _)) in self.ongoing_requests.iter() {
+-            let mut is_completed = false;
+-            if request.status == RequestStatus::Completed {
+-                is_completed = true;
+-            }
+-            if let Some(request_ts) = request.ts {
+-                if request_ts <= ts {
+-                    is_completed = true;
+-                }
+-            }
+-            if is_completed {
++            // Successful mutations must wait until queries have observed their
++            // commit; an older transition can still be in flight at the response.
++            if request.status == RequestStatus::Completed
++                && request.ts.is_some_and(|request_ts| request_ts <= ts)
++            {
+                 completed_requests.insert(*id);
+             }
+         }
 diff --git a/src/client/mod.rs b/src/client/mod.rs
 index 063cd4487ef0e1ade474ba8dcc706b7cb5b1d13f..b2a122827762392ce9ad2630c229ed0d74c1936d 100644
 --- a/src/client/mod.rs
@@ -397,14 +521,15 @@ index 0f3b47868435a26f11e1ce6c22c199880aa699fa..a125ae641ae3b4a6be288883702b43d8
  /// Queries can be added to the query set via [`ConvexClient::subscribe`].
  /// Queries can be removed from the query set via dropping the
 diff --git a/src/client/worker.rs b/src/client/worker.rs
-index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790f6507888 100644
+index 658dd951f0ed741ab6e9b738e6e76c38300c602e..41f39110954b42e3588ecf4ba091ccf2d1214f1d 100644
 --- a/src/client/worker.rs
 +++ b/src/client/worker.rs
 @@ -1,6 +1,11 @@
  use std::{
      collections::BTreeMap,
-     convert::Infallible,
+-    convert::Infallible,
 +    future::Future,
++    ops::ControlFlow,
 +    panic::{
 +        resume_unwind,
 +        AssertUnwindSafe,
@@ -449,7 +574,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
      },
      value::Value,
      FunctionResult,
-@@ -76,12 +89,62 @@ pub struct UnsubscribeRequest {
+@@ -76,13 +89,63 @@ pub struct UnsubscribeRequest {
      pub subscriber_id: SubscriberId,
  }
  
@@ -481,14 +606,14 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
 +        let result = AssertUnwindSafe(async {
 +            tokio::select! { biased;
 +                _ = shutdown.changed() => {},
-+                never = run(
++                () = run(
 +                    protocol_response_receiver,
 +                    client_request_receiver,
 +                    watch_sender,
 +                    base_client,
 +                    &mut protocol_manager,
 +                    observer,
-+                ) => match never {},
++                ) => {},
 +            }
 +        })
 +        .catch_unwind()
@@ -509,12 +634,14 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
      mut watch_sender: broadcast::Sender<QueryResults>,
      mut base_client: BaseConvexClient,
 -    mut protocol_manager: T,
+-) -> Infallible {
 +    protocol_manager: &mut T,
 +    observer: Option<ClientObserver>,
- ) -> Infallible {
++) {
      let mut backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
      loop {
-@@ -91,7 +154,8 @@ pub async fn worker<T: SyncProtocol>(
+         let e = loop {
+@@ -91,15 +154,23 @@ pub async fn worker<T: SyncProtocol>(
                  &mut client_request_receiver,
                  &mut watch_sender,
                  &mut base_client,
@@ -524,7 +651,10 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
              )
              .await
              {
-@@ -100,6 +164,12 @@ pub async fn worker<T: SyncProtocol>(
+-                Ok(()) => backoff.reset(),
++                Ok(ControlFlow::Continue(())) => backoff.reset(),
++                Ok(ControlFlow::Break(())) => return,
+                 Err(e) => break e,
              }
          };
  
@@ -537,15 +667,17 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
          let delay = backoff.fail(&mut rand::rng());
          tracing::error!(
              "Convex Client Worker failed: {e:?}. Backing off for {delay:?} and retrying."
-@@ -128,6 +198,7 @@ async fn _worker_once<T: SyncProtocol>(
+@@ -128,7 +199,8 @@ async fn _worker_once<T: SyncProtocol>(
      watch_sender: &mut broadcast::Sender<QueryResults>,
      base_client: &mut BaseConvexClient,
      protocol_manager: &mut T,
+-) -> Result<(), ReconnectProtocolReason> {
 +    observer: Option<&ClientObserver>,
- ) -> Result<(), ReconnectProtocolReason> {
++) -> Result<ControlFlow<()>, ReconnectProtocolReason> {
      // If there are any outgoing messages to flush (e.g. from an outer reconnect),
      // do so first.
-@@ -136,12 +207,13 @@ async fn _worker_once<T: SyncProtocol>(
+     communicate(
+@@ -136,12 +208,18 @@ async fn _worker_once<T: SyncProtocol>(
          protocol_response_receiver,
          watch_sender,
          protocol_manager,
@@ -554,13 +686,19 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
      .await?;
  
      tokio::select! {
-         Some(protocol_response) = protocol_response_receiver.recv() => {
+-        Some(protocol_response) = protocol_response_receiver.recv() => {
 -            handle_protocol_response(base_client, watch_sender, protocol_response)?;
++        protocol_response = protocol_response_receiver.recv() => {
++            let Some(protocol_response) = protocol_response else {
++                // A terminated transport cannot reconnect. End pending requests and
++                // join it through the shared close owner, even with live client clones.
++                return Ok(ControlFlow::Break(()));
++            };
 +            handle_protocol_response(base_client, watch_sender, protocol_response, observer)?;
          }
          Some(client_request) = client_request_receiver.recv() => {
              match client_request {
-@@ -157,6 +229,7 @@ async fn _worker_once<T: SyncProtocol>(
+@@ -157,6 +235,7 @@ async fn _worker_once<T: SyncProtocol>(
                          protocol_response_receiver,
                          watch_sender,
                          protocol_manager,
@@ -568,7 +706,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
                      )
                      .await?;
  
-@@ -181,6 +254,7 @@ async fn _worker_once<T: SyncProtocol>(
+@@ -181,6 +260,7 @@ async fn _worker_once<T: SyncProtocol>(
                              protocol_response_receiver,
                              watch_sender,
                              protocol_manager,
@@ -576,7 +714,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
                          )
                          .await?;
                      let _ = tx.send(result_receiver);
-@@ -197,6 +271,7 @@ async fn _worker_once<T: SyncProtocol>(
+@@ -197,6 +277,7 @@ async fn _worker_once<T: SyncProtocol>(
                              protocol_response_receiver,
                              watch_sender,
                              protocol_manager,
@@ -584,7 +722,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
                          )
                          .await?;
                      let _ = tx.send(result_receiver);
-@@ -209,6 +284,7 @@ async fn _worker_once<T: SyncProtocol>(
+@@ -209,6 +290,7 @@ async fn _worker_once<T: SyncProtocol>(
                          protocol_response_receiver,
                          watch_sender,
                          protocol_manager,
@@ -592,7 +730,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
                      )
                      .await?;
                  },
-@@ -219,6 +295,7 @@ async fn _worker_once<T: SyncProtocol>(
+@@ -219,16 +301,14 @@ async fn _worker_once<T: SyncProtocol>(
                          protocol_response_receiver,
                          watch_sender,
                          protocol_manager,
@@ -600,7 +738,18 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
                      )
                      .await?;
                  },
-@@ -237,6 +314,7 @@ async fn communicate<P: SyncProtocol>(
+             }
+         },
+-        // TODO: this else branch will lead to an infinite loop if both channels
+-        // are closed
+-        else => (),
+     }
+-    Ok(())
++    Ok(ControlFlow::Continue(()))
+ }
+ 
+ /// Flush all messages to the protocol while processing server mesages.
+@@ -237,6 +317,7 @@ async fn communicate<P: SyncProtocol>(
      protocol_response_receiver: &mut mpsc::Receiver<ProtocolResponse>,
      watch_sender: &mut broadcast::Sender<QueryResults>,
      protocol: &mut P,
@@ -608,7 +757,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
  ) -> Result<(), ReconnectProtocolReason> {
      while let Some(modification) = base_client.pop_next_message() {
          let mut send_future = protocol.send(modification);
-@@ -246,7 +324,9 @@ async fn communicate<P: SyncProtocol>(
+@@ -246,7 +327,9 @@ async fn communicate<P: SyncProtocol>(
                 // Keep processing protocol responses while waiting so that we
                 // don't deadlock with the websocket worker.
                 Some(protocol_response) = protocol_response_receiver.recv() => {
@@ -619,7 +768,7 @@ index 658dd951f0ed741ab6e9b738e6e76c38300c602e..95f0d87afe9e1737c097b96856bc0790
                 }
              }
          }
-@@ -258,10 +338,16 @@ fn handle_protocol_response(
+@@ -258,10 +341,16 @@ fn handle_protocol_response(
      base_client: &mut BaseConvexClient,
      watch_sender: &mut broadcast::Sender<QueryResults>,
      protocol_response: ProtocolResponse,
@@ -689,9 +838,16 @@ index d61d360897cc465155be044f22f1fb335ae47faa..d66271983ea9e1e8b9b8585901f2e8ce
 +    }
  }
 diff --git a/src/sync/web_socket_manager.rs b/src/sync/web_socket_manager.rs
-index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162fddfa59df 100644
+index 95930cb27ebae65d4bc4dc5df069681cf783f132..697cc65fdbada73daa5c40a600e838e6993d3b0e 100644
 --- a/src/sync/web_socket_manager.rs
 +++ b/src/sync/web_socket_manager.rs
+@@ -1,5 +1,5 @@
+ use std::{
+-    convert::Infallible,
++    ops::ControlFlow,
+     time::Duration,
+ };
+ 
 @@ -50,11 +50,17 @@ use url::Url;
  use uuid::Uuid;
  
@@ -715,7 +871,7 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
  };
  
  const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-@@ -75,12 +81,20 @@ struct WebSocketWorker {
+@@ -75,16 +81,24 @@ struct WebSocketWorker {
      ws_url: Url,
      on_response: mpsc::Sender<ProtocolResponse>,
      on_state_change: Option<mpsc::Sender<WebSocketState>>,
@@ -736,6 +892,11 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
  
  pub struct WebSocketManager {
      internal_sender: mpsc::UnboundedSender<WebSocketRequest>,
+-    worker_handle: JoinHandle<Infallible>,
++    worker_handle: JoinHandle<()>,
+ }
+ impl Drop for WebSocketManager {
+     fn drop(&mut self) {
 @@ -99,17 +113,18 @@ impl SyncProtocol for WebSocketManager {
          on_response: mpsc::Sender<ProtocolResponse>,
          on_state_change: Option<mpsc::Sender<WebSocketState>>,
@@ -765,7 +926,7 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
 +    async fn close(&mut self) -> Result<(), tokio::task::JoinError> {
 +        self.worker_handle.abort();
 +        match (&mut self.worker_handle).await {
-+            Ok(never) => match never {},
++            Ok(()) => Ok(()),
 +            Err(error) if error.is_cancelled() => Ok(()),
 +            Err(error) => Err(error),
 +        }
@@ -773,7 +934,7 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
  }
  
  impl WebSocketWorker {
-@@ -136,10 +160,21 @@ impl WebSocketWorker {
+@@ -136,13 +160,24 @@ impl WebSocketWorker {
      /// How long before lack of server response causes a timeout.
      const SERVER_INACTIVITY_THRESHOLD: Duration = Duration::from_secs(30);
  
@@ -794,7 +955,11 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
 +        observer: Option<ClientObserver>,
          internal_receiver: mpsc::UnboundedReceiver<WebSocketRequest>,
          client_id: String,
-     ) -> Infallible {
+-    ) -> Infallible {
++    ) {
+         let ping_ticker = tokio::time::interval(Self::HEARTBEAT_INTERVAL);
+         let backoff = Backoff::new(INITIAL_BACKOFF, MAX_BACKOFF);
+ 
 @@ -150,6 +185,7 @@ impl WebSocketWorker {
              ws_url,
              on_response,
@@ -803,7 +968,7 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
              internal_receiver: UnboundedReceiverStream::new(internal_receiver).fuse(),
              ping_ticker,
              connection_count: 0,
-@@ -161,17 +197,13 @@ impl WebSocketWorker {
+@@ -161,20 +197,17 @@ impl WebSocketWorker {
  
          let mut last_close_reason = "InitialConnect".to_string();
          let mut max_observed_timestamp = None;
@@ -822,8 +987,41 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
 +            worker.notify_state(WebSocketState::Connecting);
  
              let e = match exit_result {
-                 Ok(reconnect) => {
-@@ -237,9 +269,7 @@ impl WebSocketWorker {
+-                Ok(reconnect) => {
++                Ok(ControlFlow::Break(())) => return,
++                Ok(ControlFlow::Continue(reconnect)) => {
+                     // WS worker exited cleanly because it got a request to reconnect
+                     tracing::debug!("Reconnecting websocket due to {}", reconnect.reason);
+                     last_close_reason = reconnect.reason;
+@@ -197,12 +230,16 @@ impl WebSocketWorker {
+             let _ = worker.on_response.send(ProtocolResponse::Failure).await;
+             tracing::debug!("Waiting for base client to acknowledge reconnect");
+             loop {
+-                let request = worker.internal_receiver.next().await;
++                // A closed fused stream stays ready. Stop when its owner is gone
++                // so this drain cannot spin past task cancellation during shutdown.
++                let Some(request) = worker.internal_receiver.next().await else {
++                    return;
++                };
+                 // TODO: There is a potential issue where we have multiple queued reconnect
+                 // requests in which case max_observed_timestamp might be lower than actually
+                 // observed. This is fine since it will never cause errors. Will can fix this
+                 // when we restructure the wider protocol to be a single routine.
+-                if let Some(WebSocketRequest::Reconnect(reconnect)) = request {
++                if let WebSocketRequest::Reconnect(reconnect) = request {
+                     max_observed_timestamp = reconnect.max_observed_timestamp;
+                     break;
+                 }
+@@ -220,7 +257,7 @@ impl WebSocketWorker {
+         last_close_reason: String,
+         max_seen_transition: Option<Timestamp>,
+         client_id: &str,
+-    ) -> anyhow::Result<ReconnectRequest> {
++    ) -> anyhow::Result<ControlFlow<(), ReconnectRequest>> {
+         let verb = if self.connection_count == 0 {
+             "connect"
+         } else {
+@@ -237,9 +274,7 @@ impl WebSocketWorker {
          )
          .await?;
          tracing::debug!("completed websocket {verb} to {}", self.ws_url);
@@ -834,12 +1032,35 @@ index 95930cb27ebae65d4bc4dc5df069681cf783f132..0ae4d5f895601c64d8620a62c484162f
  
          loop {
              select_biased! {
+@@ -282,7 +317,10 @@ impl WebSocketWorker {
+                         },
+                     }
+                 },
+-                request = self.internal_receiver.select_next_some() => {
++                request = self.internal_receiver.next().fuse() => {
++                    let Some(request) = request else {
++                        return Ok(ControlFlow::Break(()));
++                    };
+                     match request {
+                         WebSocketRequest::SendMessage(message, sender) => {
+                             tracing::debug!("Sending {message:?}");
+@@ -290,7 +328,9 @@ impl WebSocketWorker {
+                             internal.send_worker(msg.clone()).await?;
+                             let _ = sender.send(());
+                         },
+-                        WebSocketRequest::Reconnect(reason) => return Ok(reason),
++                        WebSocketRequest::Reconnect(reason) => {
++                            return Ok(ControlFlow::Continue(reason));
++                        },
+                     };
+                 }
+             };
 diff --git a/tests/observation.rs b/tests/observation.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..c7def22b686672ba39323fb923a707c969ba9553
+index 0000000000000000000000000000000000000000..e6810553097c0285d5aa9cf0ed3e5768d7a893dc
 --- /dev/null
 +++ b/tests/observation.rs
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,462 @@
 +use std::{
 +    collections::BTreeMap,
 +    sync::{
@@ -848,6 +1069,7 @@ index 0000000000000000000000000000000000000000..c7def22b686672ba39323fb923a707c9
 +            Ordering,
 +        },
 +        Arc,
++        Barrier,
 +    },
 +    task::Poll,
 +    time::Duration,
@@ -996,6 +1218,56 @@ index 0000000000000000000000000000000000000000..c7def22b686672ba39323fb923a707c9
 +            .context("Missing shared worker panic")?;
 +        assert!(first.is_panic());
 +        assert!(Arc::ptr_eq(first, second));
++        Ok::<_, anyhow::Error>(())
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn transport_panic_ends_pending_query_before_explicit_close() -> anyhow::Result<()> {
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let (observed, mut events) = mpsc::unbounded_channel();
++        let connected = AtomicBool::new(false);
++        let client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .with_observer(move |event| {
++                match event {
++                    ClientEvent::ConnectionState(WebSocketState::Connected) => {
++                        connected.store(true, Ordering::SeqCst);
++                    },
++                    ClientEvent::ConnectionState(WebSocketState::Connecting)
++                        if connected.swap(false, Ordering::SeqCst) =>
++                    {
++                        // Inject one transport-task panic before it can send Failure.
++                        // Observer panic recovery is not a supported callback contract.
++                        panic!("transport fixture failed");
++                    },
++                    _ => {},
++                }
++                let _ = observed.send(event);
++            })
++            .build()
++            .await?;
++        let (stream, _) = listener.accept().await?;
++        let mut socket = accept_async(stream).await?;
++        let mut querying = client.clone();
++        let query =
++            tokio::spawn(async move { querying.query("test:value", BTreeMap::new()).await });
++        while !matches!(
++            receive(&mut socket).await?,
++            ClientMessage::ModifyQuerySet { .. }
++        ) {}
++        socket.close(None).await?;
++        while !matches!(
++            events.recv().await.context("Observer closed")?,
++            ClientEvent::Closed
++        ) {}
++        assert!(query.await?.is_err());
++        let error = client.close().await.unwrap_err();
++        assert!(error
++            .downcast_ref::<Arc<tokio::task::JoinError>>()
++            .context("Missing transport panic")?
++            .is_panic());
 +        Ok::<_, anyhow::Error>(())
 +    })
 +    .await?
@@ -1181,6 +1453,557 @@ index 0000000000000000000000000000000000000000..c7def22b686672ba39323fb923a707c9
 +            }
 +        }
 +        Ok(())
++    })
++    .await?
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn last_client_drop_ends_transport_waiting_for_reconnect_ack() -> anyhow::Result<()> {
++    // A non-yielding regression can also block runtime teardown after this
++    // timeout fires, so the test runner needs an external process deadline.
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let (observed, mut events) = mpsc::unbounded_channel();
++        let release_transport = Arc::new(Barrier::new(2));
++        let transport_gate = release_transport.clone();
++        let connected = AtomicBool::new(false);
++        let mut client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .with_observer(move |event| {
++                let hold_transport = match event {
++                    ClientEvent::ConnectionState(WebSocketState::Connected) => {
++                        connected.store(true, Ordering::SeqCst);
++                        false
++                    },
++                    ClientEvent::ConnectionState(WebSocketState::Connecting) => {
++                        connected.swap(false, Ordering::SeqCst)
++                    },
++                    _ => false,
++                };
++                let _ = observed.send(event);
++                if hold_transport {
++                    // Fixture-only scheduler gate: keep this transport poll active
++                    // while its owner drops. Release it before requiring termination.
++                    transport_gate.wait();
++                }
++            })
++            .build()
++            .await?;
++        let (stream, _) = listener.accept().await?;
++        let mut socket = accept_async(stream).await?;
++        while !matches!(
++            events.recv().await.context("Observer closed")?,
++            ClientEvent::ConnectionState(WebSocketState::Connected)
++        ) {}
++        let mut subscription = client.subscribe("test:value", BTreeMap::new()).await?;
++
++        // Failure has not reached the query worker, so it cannot acknowledge
++        // reconnect. The subscription keeps its sender without keeping the owner.
++        socket.close(None).await?;
++        assert!(matches!(
++            events.recv().await,
++            Some(ClientEvent::ConnectionState(WebSocketState::Connecting))
++        ));
++        drop(client);
++        assert!(matches!(events.recv().await, Some(ClientEvent::Closed)));
++        // One of the two runtime threads is held in the transport callback.
++        // A spawned task on the other thread runs only after the query worker's
++        // cancellation destructor has returned and dropped the transport owner.
++        tokio::spawn(async {}).await?;
++        release_transport.wait();
++        while let Some(event) = events.recv().await {
++            assert!(matches!(
++                event,
++                ClientEvent::ConnectionState(WebSocketState::Connecting)
++            ));
++        }
++        // Closed alone is insufficient: channel closure also requires the
++        // transport task to release its observer, despite the retained token.
++        assert!(subscription.next().await.is_none());
++        Ok::<_, anyhow::Error>(())
++    })
++    .await?
++}
+diff --git a/tests/reconnect.rs b/tests/reconnect.rs
+index d048d3a87adf3a8c9d52732e775b9ef016b73d66..8d7a78bcfa6403bc5df1c0181c4502e618deda7e 100644
+--- a/tests/reconnect.rs
++++ b/tests/reconnect.rs
+@@ -5,11 +5,15 @@ use std::{
+ 
+ use anyhow::Context;
+ use convex::{
++    base_client::BaseConvexClient,
++    ClientEvent,
+     ConvexClient,
++    ConvexClientBuilder,
+     FunctionResult,
+     Value,
+ };
+ use convex_sync_types::{
++    types::ErrorPayload,
+     ClientMessage,
+     LogLinesMessage,
+     ServerMessage,
+@@ -26,6 +30,7 @@ use tokio::{
+         TcpListener,
+         TcpStream,
+     },
++    sync::mpsc,
+     time::timeout,
+ };
+ use tokio_tungstenite::{
+@@ -45,18 +50,24 @@ async fn receive_message(socket: &mut WebSocketStream<TcpStream>) -> anyhow::Res
+ 
+ async fn accept_connection(
+     listener: &TcpListener,
+-) -> anyhow::Result<(WebSocketStream<TcpStream>, SessionId, u32)> {
++) -> anyhow::Result<(
++    WebSocketStream<TcpStream>,
++    SessionId,
++    u32,
++    Option<Timestamp>,
++)> {
+     let (stream, _) = listener.accept().await?;
+     let mut socket = accept_async(stream).await?;
+     let ClientMessage::Connect {
+         session_id,
+         connection_count,
++        max_observed_timestamp,
+         ..
+     } = receive_message(&mut socket).await?
+     else {
+         anyhow::bail!("Expected Connect as the first message");
+     };
+-    Ok((socket, session_id, connection_count))
++    Ok((socket, session_id, connection_count, max_observed_timestamp))
+ }
+ 
+ #[tokio::test]
+@@ -70,17 +81,35 @@ async fn mutation_is_deduplicated_after_losing_responses() -> anyhow::Result<()>
+             let mut counter = 0_i64;
+             let mut sessions = Vec::new();
+             let mut mutations = Vec::new();
+-            for attempt in 0..3 {
+-                let (mut socket, session_id, connection_count) =
++            for attempt in 0..4 {
++                let (mut socket, session_id, connection_count, observed_ts) =
+                     accept_connection(&listener).await?;
+                 assert_eq!(connection_count, attempt);
++                assert_eq!(
++                    observed_ts,
++                    if attempt == 3 {
++                        Some(Timestamp::try_from(1_i64)?)
++                    } else {
++                        None
++                    }
++                );
+                 sessions.push(session_id);
+ 
+                 let mut version = StateVersion::initial();
++                let mut restored_query_sets = 0;
+                 let request_id = loop {
+                     let message = receive_message(&mut socket).await?;
+                     match message {
+-                        ClientMessage::ModifyQuerySet { new_version, .. } => {
++                        ClientMessage::ModifyQuerySet {
++                            base_version,
++                            new_version,
++                            modifications,
++                        } => {
++                            assert!(attempt > 0);
++                            assert_eq!(base_version, StateVersion::initial().query_set);
++                            assert_eq!(*new_version, *base_version + 1);
++                            assert!(modifications.is_empty());
++                            restored_query_sets += 1;
+                             version.query_set = new_version;
+                         },
+                         ClientMessage::Mutation { request_id, .. } => {
+@@ -90,6 +119,7 @@ async fn mutation_is_deduplicated_after_losing_responses() -> anyhow::Result<()>
+                         _ => anyhow::bail!("Unexpected client message: {message:?}"),
+                     }
+                 };
++                assert_eq!(restored_query_sets, usize::from(attempt > 0));
+ 
+                 // Model the backend's committed-success lookup by (session_id, request_id).
+                 let result = *committed
+@@ -104,18 +134,28 @@ async fn mutation_is_deduplicated_after_losing_responses() -> anyhow::Result<()>
+                     continue;
+                 }
+ 
+-                version.ts = Timestamp::try_from(result)?;
+                 let response = ServerMessage::MutationResponse {
+                     request_id,
+                     result: Ok(Value::Int64(result)),
+-                    ts: Some(version.ts),
++                    ts: Some(Timestamp::try_from(result)?),
+                     log_lines: LogLinesMessage(vec![]),
+                 };
+-                socket
+-                    .send(Message::Text(
+-                        serde_json::Value::from(response).to_string().into(),
+-                    ))
+-                    .await?;
++                if attempt == 2 {
++                    socket
++                        .send(Message::Text(
++                            serde_json::Value::from(response).to_string().into(),
++                        ))
++                        .await?;
++                    // Close after the response but before any transition. The next
++                    // Connect's timestamp proves the client processed the success.
++                    socket.close(None).await?;
++                    drop(socket);
++                    continue;
++                }
++
++                // The replay is in flight when this transition completes the retained
++                // mutation. Its later response must leave this connection usable.
++                version.ts = Timestamp::try_from(result + 1)?;
+                 let transition = ServerMessage::<Value>::Transition {
+                     start_version: StateVersion::initial(),
+                     end_version: version,
+@@ -128,16 +168,86 @@ async fn mutation_is_deduplicated_after_losing_responses() -> anyhow::Result<()>
+                         serde_json::Value::from(transition).to_string().into(),
+                     ))
+                     .await?;
++                socket
++                    .send(Message::Text(
++                        serde_json::Value::from(response).to_string().into(),
++                    ))
++                    .await?;
++
++                let following = receive_message(&mut socket).await?;
++                let mut expected = mutations[0].clone();
++                let ClientMessage::Mutation {
++                    request_id: next, ..
++                } = &mut expected
++                else {
++                    anyhow::bail!("Expected original mutation");
++                };
++                *next = request_id + 1;
++                assert_eq!(
++                    following, expected,
++                    "Following mutation must use the same socket"
++                );
++                mutations.push(following);
++                counter += 1;
++                assert!(committed
++                    .insert((Uuid::from(session_id), request_id + 1), counter)
++                    .is_none());
++                let end_version = StateVersion {
++                    ts: version.ts.succ()?,
++                    ..version
++                };
++                for response in [
++                    ServerMessage::MutationResponse {
++                        request_id: request_id + 1,
++                        result: Ok(Value::Int64(counter)),
++                        ts: Some(end_version.ts),
++                        log_lines: LogLinesMessage(vec![]),
++                    },
++                    ServerMessage::Transition {
++                        start_version: version,
++                        end_version,
++                        modifications: vec![],
++                        client_clock_skew: None,
++                        server_ts: None,
++                    },
++                ] {
++                    socket
++                        .send(Message::Text(
++                            serde_json::Value::from(response).to_string().into(),
++                        ))
++                        .await?;
++                }
++                // Keep the peer alive through explicit close; no sixth submission is valid.
++                while let Some(frame) = socket.next().await {
++                    match frame {
++                        Ok(Message::Text(_)) => anyhow::bail!("Unexpected sixth submission"),
++                        Ok(Message::Close(_)) | Err(_) => break,
++                        _ => {},
++                    }
++                }
+             }
+             Ok::<_, anyhow::Error>((counter, sessions, mutations))
+         };
+ 
+-        let (result, (counter, sessions, mutations)) =
+-            futures::try_join!(client.mutation("incrementCounter", BTreeMap::new()), server,)?;
+-        assert_eq!(result, FunctionResult::Value(Value::Int64(1)));
+-        assert_eq!(counter, 1, "The mutation must commit only once");
++        let caller = async {
++            for result in [1, 2] {
++                assert_eq!(
++                    client.mutation("incrementCounter", BTreeMap::new()).await?,
++                    FunctionResult::Value(Value::Int64(result))
++                );
++            }
++            client.close().await
++        };
++        let ((), (counter, sessions, mutations)) = futures::try_join!(caller, server)?;
++        assert_eq!(counter, 2, "Each logical mutation must commit only once");
++        assert_eq!(sessions.len(), 4);
+         assert!(sessions.windows(2).all(|pair| pair[0] == pair[1]));
+-        assert!(mutations.windows(2).all(|pair| pair[0] == pair[1]));
++        assert_eq!(
++            mutations.len(),
++            5,
++            "Four original submissions and one following mutation"
++        );
++        assert!(mutations[..4].windows(2).all(|pair| pair[0] == pair[1]));
+         Ok(())
+     })
+     .await?
+@@ -149,9 +259,10 @@ async fn independent_clients_have_distinct_sessions() -> anyhow::Result<()> {
+         let listener = TcpListener::bind("127.0.0.1:0").await?;
+         let url = format!("http://{}", listener.local_addr()?);
+         let _first_client = ConvexClient::new(&url).await?;
+-        let (_first_socket, first_session, first_count) = accept_connection(&listener).await?;
++        let (_first_socket, first_session, first_count, _) = accept_connection(&listener).await?;
+         let _second_client = ConvexClient::new(&url).await?;
+-        let (_second_socket, second_session, second_count) = accept_connection(&listener).await?;
++        let (_second_socket, second_session, second_count, _) =
++            accept_connection(&listener).await?;
+ 
+         assert_ne!(first_session, second_session);
+         assert_eq!(first_count, 0);
+@@ -160,3 +271,240 @@ async fn independent_clients_have_distinct_sessions() -> anyhow::Result<()> {
+     })
+     .await?
+ }
++
++#[test]
++fn mutation_responses_still_validate_request_identity_and_type() -> anyhow::Result<()> {
++    let mut client = BaseConvexClient::new();
++    let committed = Timestamp::try_from(1_i64)?;
++    let response = |request_id| ServerMessage::MutationResponse {
++        request_id,
++        result: Ok(Value::Int64(1)),
++        ts: Some(committed),
++        log_lines: LogLinesMessage(vec![]),
++    };
++    assert!(client.receive_message(response(0)).is_err());
++
++    let mut action = client.action("test:action".parse()?, BTreeMap::new());
++    let Some(ClientMessage::Action { request_id, .. }) = client.pop_next_message() else {
++        anyhow::bail!("Expected action");
++    };
++    assert!(client.receive_message(response(request_id)).is_err());
++    assert!(matches!(
++        action.try_recv(),
++        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
++    ));
++    let response = ServerMessage::ActionResponse {
++        request_id,
++        result: Ok(Value::Int64(2)),
++        log_lines: LogLinesMessage(vec![]),
++    };
++    assert!(client.receive_message(response.clone()).is_ok());
++    assert_eq!(action.try_recv()?, FunctionResult::Value(Value::Int64(2)));
++    assert!(client.receive_message(response).is_err());
++    assert!(client
++        .receive_message(ServerMessage::MutationResponse {
++            request_id: request_id + 1,
++            result: Ok(Value::Int64(3)),
++            ts: Some(committed),
++            log_lines: LogLinesMessage(vec![]),
++        })
++        .is_err());
++    Ok(())
++}
++
++#[tokio::test]
++async fn mutation_completion_respects_commit_timestamp_and_structured_errors() -> anyhow::Result<()>
++{
++    timeout(Duration::from_secs(5), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let (observed, mut transitions) = mpsc::unbounded_channel();
++        let mut client = ConvexClientBuilder::new(&format!("http://{}", listener.local_addr()?))
++            .with_observer(move |event| {
++                if let ClientEvent::QueryResults(results) = event {
++                    let _ = observed.send(results);
++                }
++            })
++            .build()
++            .await?;
++        let (mut socket, ..) = accept_connection(&listener).await?;
++        let mut mutation_client = client.clone();
++        let mut mutation = Box::pin(mutation_client.mutation("test:write", BTreeMap::new()));
++        assert!(matches!(
++            futures::poll!(&mut mutation),
++            std::task::Poll::Pending
++        ));
++        let ClientMessage::Mutation { request_id, .. } = receive_message(&mut socket).await? else {
++            anyhow::bail!("Expected mutation");
++        };
++        let committed = Timestamp::try_from(10_i64)?;
++        let response = ServerMessage::MutationResponse {
++            request_id,
++            result: Ok(Value::Int64(1)),
++            ts: Some(committed),
++            log_lines: LogLinesMessage(vec![]),
++        };
++        socket
++            .send(Message::Text(
++                serde_json::Value::from(response).to_string().into(),
++            ))
++            .await?;
++        let mut version = StateVersion::initial();
++        for ts in [Timestamp::try_from(5_i64)?, committed] {
++            let end_version = StateVersion { ts, ..version };
++            let transition = ServerMessage::<Value>::Transition {
++                start_version: version,
++                end_version,
++                modifications: vec![],
++                client_clock_skew: None,
++                server_ts: None,
++            };
++            socket
++                .send(Message::Text(
++                    serde_json::Value::from(transition).to_string().into(),
++                ))
++                .await?;
++            transitions.recv().await.context("Missing transition")?;
++            if ts < committed {
++                assert!(
++                    matches!(futures::poll!(&mut mutation), std::task::Poll::Pending),
++                    "An older query snapshot cannot complete the write"
++                );
++            }
++            version = end_version;
++        }
++        assert_eq!(mutation.await?, FunctionResult::Value(Value::Int64(1)));
++
++        let error = ErrorPayload::ErrorData {
++            message: "rejected".to_owned(),
++            data: Value::Int64(2),
++        };
++        let server = async {
++            let ClientMessage::Mutation {
++                request_id: next, ..
++            } = receive_message(&mut socket).await?
++            else {
++                anyhow::bail!("Expected following mutation");
++            };
++            assert_ne!(request_id, next);
++            let response = ServerMessage::MutationResponse {
++                request_id: next,
++                result: Err(error.clone()),
++                ts: None,
++                log_lines: LogLinesMessage(vec![]),
++            };
++            socket
++                .send(Message::Text(
++                    serde_json::Value::from(response).to_string().into(),
++                ))
++                .await?;
++            Ok::<_, anyhow::Error>(())
++        };
++        let (result, ()) =
++            futures::try_join!(client.mutation("test:reject", BTreeMap::new()), server)?;
++        assert_eq!(result, FunctionResult::from(Err(error)));
++        client.close().await?;
++        Ok::<_, anyhow::Error>(())
++    })
++    .await?
++}
++
++#[tokio::test]
++async fn terminal_occ_does_not_replay_and_following_mutation_survives_disconnect(
++) -> anyhow::Result<()> {
++    timeout(Duration::from_secs(10), async {
++        let listener = TcpListener::bind("127.0.0.1:0").await?;
++        let mut client = ConvexClient::new(&format!("http://{}", listener.local_addr()?)).await?;
++        let message = "OptimisticConcurrencyControlFailure: Data read or written in this mutation \
++                       changed while it was being run.";
++        let server = async {
++            let (mut socket, session, ..) = accept_connection(&listener).await?;
++            let first = receive_message(&mut socket).await?;
++            let ClientMessage::Mutation {
++                request_id: failed, ..
++            } = first
++            else {
++                anyhow::bail!("Expected first mutation");
++            };
++            let response = ServerMessage::<Value>::MutationResponse {
++                request_id: failed,
++                result: Err(ErrorPayload::Message(message.to_owned())),
++                ts: None,
++                log_lines: LogLinesMessage(vec![]),
++            };
++            socket
++                .send(Message::Text(
++                    serde_json::Value::from(response).to_string().into(),
++                ))
++                .await?;
++            let second = receive_message(&mut socket).await?;
++            let ClientMessage::Mutation {
++                request_id: pending,
++                ..
++            } = second
++            else {
++                anyhow::bail!("Expected following mutation on the same socket");
++            };
++            assert_ne!(failed, pending);
++            drop(socket);
++            let (mut socket, resumed, count, _) = accept_connection(&listener).await?;
++            assert_eq!(session, resumed);
++            assert_eq!(count, 1);
++            let ClientMessage::ModifyQuerySet { new_version, .. } =
++                receive_message(&mut socket).await?
++            else {
++                anyhow::bail!("Expected restored query set");
++            };
++            let replay = receive_message(&mut socket).await?;
++            assert_eq!(replay, second, "Only the pending mutation may be replayed");
++            let version = StateVersion {
++                query_set: new_version,
++                ts: Timestamp::try_from(1_i64)?,
++                ..StateVersion::initial()
++            };
++            for response in [
++                ServerMessage::MutationResponse {
++                    request_id: pending,
++                    result: Ok(Value::Int64(7)),
++                    ts: Some(version.ts),
++                    log_lines: LogLinesMessage(vec![]),
++                },
++                ServerMessage::Transition {
++                    start_version: StateVersion::initial(),
++                    end_version: version,
++                    modifications: vec![],
++                    client_clock_skew: None,
++                    server_ts: None,
++                },
++            ] {
++                socket
++                    .send(Message::Text(
++                        serde_json::Value::from(response).to_string().into(),
++                    ))
++                    .await?;
++            }
++            // Keep the peer alive until explicit close and reject any fourth submission.
++            while let Some(frame) = socket.next().await {
++                match frame {
++                    Ok(Message::Text(_)) => anyhow::bail!("Unexpected fourth submission"),
++                    Ok(Message::Close(_)) | Err(_) => break,
++                    _ => {},
++                }
++            }
++            Ok::<_, anyhow::Error>(())
++        };
++        let caller = async {
++            assert_eq!(
++                client.mutation("test:conflict", BTreeMap::new()).await?,
++                FunctionResult::ErrorMessage(message.to_owned())
++            );
++            assert_eq!(
++                client.mutation("test:following", BTreeMap::new()).await?,
++                FunctionResult::Value(Value::Int64(7))
++            );
++            client.close().await
++        };
++        futures::try_join!(caller, server)?;
++        Ok::<_, anyhow::Error>(())
 +    })
 +    .await?
 +}
