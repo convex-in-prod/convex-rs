@@ -1,3 +1,3 @@
 # patch-file source-commit
-0001-sync-Keep-sessions-stable-across-reconnects.patch 96a2e3dd87ca5f83bc3d7463b6249b8b98742196
-0002-client-expose-ordered-observations-and-joined-shutdo.patch f2e7d5fa0387095dab436ac6ba8ce4deace634d0
+0001-sync-Keep-sessions-stable-across-reconnects.patch a813ad40bff48ccf612367c0a5bb7b1ee1b570f5
+0002-client-expose-ordered-observations-and-joined-shutdo.patch bfb3392807f52cce621b3cedd6a3fd64d5a08a99
