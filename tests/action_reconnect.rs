@@ -1,4 +1,11 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{
+        AtomicBool,
+        Ordering,
+    },
+    task::Poll,
+};
 
 use convex::{
     base_client::BaseConvexClient,
@@ -6,6 +13,7 @@ use convex::{
     Value,
 };
 use convex_sync_types::{
+    AuthenticationToken,
     ClientMessage,
     ErrorPayload,
     LogLinesMessage,
@@ -111,6 +119,56 @@ async fn queued_action_survives_reconnects_until_handed_to_transport() -> anyhow
     );
     assert!(std::iter::from_fn(|| client.pop_next_message())
         .all(|message| !matches!(message, ClientMessage::Action { .. })));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_auth_refresh_preserves_queued_action() -> anyhow::Result<()> {
+    let mut client = BaseConvexClient::new();
+    let first_refresh = AtomicBool::new(true);
+    client
+        .set_auth_fetcher(Some(Box::new(move |force_refresh| {
+            let wait = force_refresh && first_refresh.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if wait {
+                    std::future::pending::<()>().await;
+                }
+                Ok(AuthenticationToken::User("test-token".into()))
+            })
+        })))
+        .await;
+    assert!(matches!(
+        client.pop_next_message(),
+        Some(ClientMessage::Authenticate { .. })
+    ));
+    let mut action = client.action("test:action".parse()?, BTreeMap::new());
+
+    let mut restart = Box::pin(client.resend_ongoing_queries_mutations());
+    assert!(matches!(futures::poll!(&mut restart), Poll::Pending));
+    drop(restart);
+    client.resend_ongoing_queries_mutations().await;
+
+    assert_eq!(action.try_recv(), Err(TryRecvError::Empty));
+    assert!(matches!(
+        client.pop_next_message(),
+        Some(ClientMessage::Authenticate { .. })
+    ));
+    assert!(matches!(
+        client.pop_next_message(),
+        Some(ClientMessage::ModifyQuerySet { .. })
+    ));
+    let Some(ClientMessage::Action { request_id: 0, .. }) = client.pop_next_message() else {
+        panic!("Expected the action's first send after cancelled auth refresh");
+    };
+    assert!(client.pop_next_message().is_none());
+    client
+        .receive_message(ServerMessage::ActionResponse {
+            request_id: 0,
+            result: Ok(Value::Int64(9)),
+            log_lines: LogLinesMessage(vec![]),
+        })
+        .unwrap();
+    assert_eq!(action.try_recv()?, FunctionResult::Value(Value::Int64(9)));
     Ok(())
 }
 

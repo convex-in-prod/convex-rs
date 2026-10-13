@@ -1,6 +1,6 @@
 # Maintained Rust client patches
 
-The source branch carries three patches over the reviewed upstream base. The orphan
+The source branch carries four patches over the reviewed upstream base. The orphan
 `patch-history` branch records their exact upstream commit, ordered mail patches,
 source IDs and reconstructed result tree.
 
@@ -53,6 +53,9 @@ have executed them before the connection was lost. Actions still in the base
 client's outgoing queue remain eligible for their first send, including across
 repeated partial reconnect drains. Popping an action from that queue is the
 handoff boundary; it does not prove server execution or authorize replay.
+Cancelling reconnect during auth refresh preserves queued actions for their
+first send on the next attempt. This cancellation correction is a separate
+follow-up in the maintained source history and is folded into the upstream proposal.
 
 Upstream proposal: [PR #18](https://github.com/get-convex/convex-rs/pull/18).
 
@@ -66,8 +69,8 @@ omitted generated testing modules; the focused fixtures were also exercised thro
 a downstream harness importing the actual SDK sources.
 
 Base-client regressions also cover action failure after handoff, actions still
-queued across repeated reconnects, completed action results, and continued
-mutation and subscription restoration.
+queued across repeated reconnects or cancelled auth refresh, completed action
+results, and continued mutation and subscription restoration.
 
 Consumers may pin the reviewed source revision or retain an immutable source
 snapshot. These patches need no crates.io version change, registry publication or

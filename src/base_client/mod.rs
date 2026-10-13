@@ -745,6 +745,10 @@ impl BaseConvexClient {
     /// already handed to the transport fail because their execution is
     /// uncertain.
     pub async fn resend_ongoing_queries_mutations(&mut self) {
+        // Keep the queue intact while auth refresh can yield. If this future is
+        // cancelled and retried, queued actions still have not been handed off.
+        let state_restart_messages = self.state.restart().await;
+
         // Only actions still in this queue are known not to have reached the
         // transport. Preserve them across even repeated, partially drained
         // reconnects without replaying actions whose results were lost.
@@ -764,7 +768,6 @@ impl BaseConvexClient {
         // that conflict with the fresh restart messages.
         self.outgoing_message_queue.clear();
 
-        let state_restart_messages = self.state.restart().await;
         let mut ongoing_request_messages = self.request_manager.restart(&unsent_actions);
 
         self.remote_query_set = RemoteQuerySet::new();
