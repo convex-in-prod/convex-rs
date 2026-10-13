@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Wed, 30 Sep 2026 01:01:04 +0800
-Subject: [PATCH 2/2] client: expose ordered observations and joined shutdown
+Subject: [PATCH 2/3] client: expose ordered observations and joined shutdown
 
 Install a synchronous observer before workers start, report each received
 query-set transition and connection state, and report terminal closure
