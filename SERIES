@@ -2,3 +2,4 @@
 0001-sync-Keep-sessions-stable-across-reconnects.patch a813ad40bff48ccf612367c0a5bb7b1ee1b570f5
 0002-client-expose-ordered-observations-and-joined-shutdo.patch bfb3392807f52cce621b3cedd6a3fd64d5a08a99
 0003-sync-Stop-replaying-in-flight-actions-on-reconnect.patch 4944fade3f21dc38de26193d4b85341ae1c44f38
+0004-sync-preserve-queued-actions-across-cancelled-auth-r.patch 29efaff05028109dd912e06341ea2076477ce661

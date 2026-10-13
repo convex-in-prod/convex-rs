@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Roman Leventov <leventov.ru@gmail.com>
+Date: Tue, 13 Oct 2026 21:09:36 +0800
+Subject: [PATCH 4/4] sync: preserve queued actions across cancelled auth
+ refresh
+
+Reconnect refreshes authentication before rebuilding its outgoing messages.
+Keep the existing queue intact across that await so cancelling the public
+restart future cannot discard the evidence that an action is still unsent.
+Only actions already handed to the transport fail as execution-uncertain.
+
+Add a regression that explicitly polls and cancels auth refresh, then proves
+the queued action remains eligible for its first send on the next restart.
+Document that a connection-loss error does not authorize action retries.
+
+Validation: focused formatting and whitespace checks pass. Native tests
+remain unexecuted because the local resource guard rejected their disk
+admission before Cargo started.
+---
+ patches/README.md         |  9 ++++--
+ src/base_client/mod.rs    |  5 +++-
+ src/client/mod.rs         |  4 +++
+ tests/action_reconnect.rs | 60 ++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 73 insertions(+), 5 deletions(-)
+
+diff --git a/patches/README.md b/patches/README.md
+index b1fdf21956aada665d5bcc82a56da4cce5078909..084d3f840eb6d2755ae9b9db4fdd1aae5fb91b86 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -1,6 +1,6 @@
+ # Maintained Rust client patches
+ 
+-The source branch carries three patches over the reviewed upstream base. The orphan
++The source branch carries four patches over the reviewed upstream base. The orphan
+ `patch-history` branch records their exact upstream commit, ordered mail patches,
+ source IDs and reconstructed result tree.
+ 
+@@ -53,6 +53,9 @@ have executed them before the connection was lost. Actions still in the base
+ client's outgoing queue remain eligible for their first send, including across
+ repeated partial reconnect drains. Popping an action from that queue is the
+ handoff boundary; it does not prove server execution or authorize replay.
++Cancelling reconnect during auth refresh preserves queued actions for their
++first send on the next attempt. This cancellation correction is a separate
++follow-up in the maintained source history and is folded into the upstream proposal.
+ 
+ Upstream proposal: [PR #18](https://github.com/get-convex/convex-rs/pull/18).
+ 
+@@ -66,8 +69,8 @@ omitted generated testing modules; the focused fixtures were also exercised thro
+ a downstream harness importing the actual SDK sources.
+ 
+ Base-client regressions also cover action failure after handoff, actions still
+-queued across repeated reconnects, completed action results, and continued
+-mutation and subscription restoration.
++queued across repeated reconnects or cancelled auth refresh, completed action
++results, and continued mutation and subscription restoration.
+ 
+ Consumers may pin the reviewed source revision or retain an immutable source
+ snapshot. These patches need no crates.io version change, registry publication or
+diff --git a/src/base_client/mod.rs b/src/base_client/mod.rs
+index afe2db2cb29d0f88920671a4db8cafebe2384bd2..3035458bde1976083b436a6b5f6588cbe2395978 100644
+--- a/src/base_client/mod.rs
++++ b/src/base_client/mod.rs
+@@ -745,6 +745,10 @@ impl BaseConvexClient {
+     /// already handed to the transport fail because their execution is
+     /// uncertain.
+     pub async fn resend_ongoing_queries_mutations(&mut self) {
++        // Keep the queue intact while auth refresh can yield. If this future is
++        // cancelled and retried, queued actions still have not been handed off.
++        let state_restart_messages = self.state.restart().await;
++
+         // Only actions still in this queue are known not to have reached the
+         // transport. Preserve them across even repeated, partially drained
+         // reconnects without replaying actions whose results were lost.
+@@ -764,7 +768,6 @@ impl BaseConvexClient {
+         // that conflict with the fresh restart messages.
+         self.outgoing_message_queue.clear();
+ 
+-        let state_restart_messages = self.state.restart().await;
+         let mut ongoing_request_messages = self.request_manager.restart(&unsent_actions);
+ 
+         self.remote_query_set = RemoteQuerySet::new();
+diff --git a/src/client/mod.rs b/src/client/mod.rs
+index b2a122827762392ce9ad2630c229ed0d74c1936d..248ef2dde6f20fbd39f1d6d16652da530fc686dc 100644
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -341,6 +341,10 @@ impl ConvexClient {
+     /// Perform an action `name` with `args` and return a future
+     /// containing the return value of the action once it completes.
+     ///
++    /// An action handed to the transport is not replayed on reconnect because
++    /// it may already have executed. A connection-loss error does not mean the
++    /// server cancelled the action or that retrying it is safe.
++    ///
+     /// ```no_run
+     /// # use convex::ConvexClient;
+     /// # use futures::StreamExt;
+diff --git a/tests/action_reconnect.rs b/tests/action_reconnect.rs
+index 3ff0aeaa9fea6faa684d3368107e57d9e154b7d9..e286b1ff8e90b82d3f70d228c1fe4f7c1368fa95 100644
+--- a/tests/action_reconnect.rs
++++ b/tests/action_reconnect.rs
+@@ -1,4 +1,11 @@
+-use std::collections::BTreeMap;
++use std::{
++    collections::BTreeMap,
++    sync::atomic::{
++        AtomicBool,
++        Ordering,
++    },
++    task::Poll,
++};
+ 
+ use convex::{
+     base_client::BaseConvexClient,
+@@ -6,6 +13,7 @@ use convex::{
+     Value,
+ };
+ use convex_sync_types::{
++    AuthenticationToken,
+     ClientMessage,
+     ErrorPayload,
+     LogLinesMessage,
+@@ -114,6 +122,56 @@ async fn queued_action_survives_reconnects_until_handed_to_transport() -> anyhow
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn cancelled_auth_refresh_preserves_queued_action() -> anyhow::Result<()> {
++    let mut client = BaseConvexClient::new();
++    let first_refresh = AtomicBool::new(true);
++    client
++        .set_auth_fetcher(Some(Box::new(move |force_refresh| {
++            let wait = force_refresh && first_refresh.swap(false, Ordering::SeqCst);
++            Box::pin(async move {
++                if wait {
++                    std::future::pending::<()>().await;
++                }
++                Ok(AuthenticationToken::User("test-token".into()))
++            })
++        })))
++        .await;
++    assert!(matches!(
++        client.pop_next_message(),
++        Some(ClientMessage::Authenticate { .. })
++    ));
++    let mut action = client.action("test:action".parse()?, BTreeMap::new());
++
++    let mut restart = Box::pin(client.resend_ongoing_queries_mutations());
++    assert!(matches!(futures::poll!(&mut restart), Poll::Pending));
++    drop(restart);
++    client.resend_ongoing_queries_mutations().await;
++
++    assert_eq!(action.try_recv(), Err(TryRecvError::Empty));
++    assert!(matches!(
++        client.pop_next_message(),
++        Some(ClientMessage::Authenticate { .. })
++    ));
++    assert!(matches!(
++        client.pop_next_message(),
++        Some(ClientMessage::ModifyQuerySet { .. })
++    ));
++    let Some(ClientMessage::Action { request_id: 0, .. }) = client.pop_next_message() else {
++        panic!("Expected the action's first send after cancelled auth refresh");
++    };
++    assert!(client.pop_next_message().is_none());
++    client
++        .receive_message(ServerMessage::ActionResponse {
++            request_id: 0,
++            result: Ok(Value::Int64(9)),
++            log_lines: LogLinesMessage(vec![]),
++        })
++        .unwrap();
++    assert_eq!(action.try_recv()?, FunctionResult::Value(Value::Int64(9)));
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn completed_action_keeps_its_result_across_reconnect() -> anyhow::Result<()> {
+     for result in [

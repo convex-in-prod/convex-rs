@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Roman Leventov <leventov.ru@gmail.com>
 Date: Tue, 13 Oct 2026 19:53:09 +0800
-Subject: [PATCH 3/3] sync: Stop replaying in-flight actions on reconnect
+Subject: [PATCH 3/4] sync: Stop replaying in-flight actions on reconnect
 
 Rebuilding the reconnect queue from every retained request also replays
 actions whose responses were lost. The server may already have executed
